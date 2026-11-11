@@ -1,4 +1,4 @@
-# Builds dist/BuckshotRouletteNX-<version>.zip from the current build (no game files).
+﻿# Builds dist/BuckshotRouletteNX-<version>.zip from the current build (no game files).
 # usage: powershell -File tools/package_release.ps1 [-Version 1.0.0]
 param([string]$Version = "1.0.0")
 $ErrorActionPreference = "Stop"
@@ -17,7 +17,7 @@ Copy-Item "$root/release_assets/build_pack.bat" $stage
 Copy-Item "$root/tools/make_switch_pck.py" "$stage/pc/"
 Copy-Item "$root/patch/nx/*.gd" "$stage/pc/patch/nx/"
 Copy-Item "$root/patch/steam_stub/SteamStub.gd" "$stage/pc/patch/steam_stub/"
-Copy-Item "$root/README.md" $stage
+Copy-Item "$root/README.md" $stage; New-Item -ItemType Directory -Force "$stage/docs" | Out-Null; Copy-Item "$root/docs/ADVANCED.md" "$stage/docs/"
 Copy-Item -Recurse "$root/LICENSES" $stage
 
 $zip = Join-Path $root "dist/$name.zip"
