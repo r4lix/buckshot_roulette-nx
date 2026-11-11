@@ -1,0 +1,2566 @@
+diff --git a/SConstruct b/SConstruct
+index 22c9e18..01e2e95 100644
+--- a/SConstruct
++++ b/SConstruct
+@@ -112,6 +112,9 @@ platform_arg = ARGUMENTS.get("platform", ARGUMENTS.get("p", False))
+ 
+ if platform_arg == "android":
+     custom_tools = ["clang", "clang++", "as", "ar", "link"]
++elif platform_arg == "switch":
++    # devkitA64 cross toolchain (GNU), also when building from a Windows host.
++    custom_tools = ["gcc", "g++", "gnulink", "ar", "as", "textfile", "zip"]
+ elif platform_arg == "web":
+     # Use generic POSIX build toolchain for Emscripten.
+     custom_tools = ["cc", "c++", "ar", "link", "textfile", "zip"]
+diff --git a/drivers/gles3/rasterizer_gles3.cpp b/drivers/gles3/rasterizer_gles3.cpp
+index d66e5f5..e636d3f 100644
+--- a/drivers/gles3/rasterizer_gles3.cpp
++++ b/drivers/gles3/rasterizer_gles3.cpp
+@@ -315,6 +315,60 @@ void RasterizerGLES3::prepare_for_blitting_render_targets() {
+ 	utils->capture_timestamps_end();
+ }
+ 
++#ifdef NX_ZINK
++// Switch (Zink on NVK): the viewport is stretched to the screen with one fullscreen triangle (nearest sampling, like the
++// blit it replaces) rather than through NVK's scaled image blit, which draws two triangles.
++static GLuint nx_stretch_program = 0, nx_stretch_vao = 0;
++static GLint nx_stretch_flip = -1;
++static bool nx_stretch_init() {
++	if (nx_stretch_program) {
++		return true;
++	}
++	static const char *vs =
++			"#version 300 es\n"
++			"uniform float flip;\n"
++			"out vec2 uv;\n"
++			"void main() {\n"
++			"  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2)) * 2.0 - 1.0;\n"
++			"  uv = p * 0.5 + 0.5;\n"
++			"  if (flip > 0.5) uv.y = 1.0 - uv.y;\n"
++			"  gl_Position = vec4(p, 0.0, 1.0);\n"
++			"}\n";
++	static const char *fs =
++			"#version 300 es\n"
++			"precision mediump float;\n"
++			"uniform sampler2D src;\n"
++			"in vec2 uv;\n"
++			"out vec4 frag;\n"
++			"void main() { frag = texture(src, uv); }\n";
++	GLuint v = glCreateShader(GL_VERTEX_SHADER);
++	glShaderSource(v, 1, &vs, nullptr);
++	glCompileShader(v);
++	GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
++	glShaderSource(f, 1, &fs, nullptr);
++	glCompileShader(f);
++	GLuint p = glCreateProgram();
++	glAttachShader(p, v);
++	glAttachShader(p, f);
++	glLinkProgram(p);
++	glDeleteShader(v);
++	glDeleteShader(f);
++	GLint ok = 0;
++	glGetProgramiv(p, GL_LINK_STATUS, &ok);
++	if (!ok) {
++		glDeleteProgram(p);
++		return false;
++	}
++	nx_stretch_program = p;
++	nx_stretch_flip = glGetUniformLocation(p, "flip");
++	glUseProgram(p);
++	glUniform1i(glGetUniformLocation(p, "src"), 0);
++	glUseProgram(0);
++	glGenVertexArrays(1, &nx_stretch_vao);
++	return true;
++}
++#endif
++
+ void RasterizerGLES3::_blit_render_target_to_screen(RID p_render_target, DisplayServer::WindowID p_screen, const Rect2 &p_screen_rect, uint32_t p_layer, bool p_first) {
+ 	GLES3::RenderTarget *rt = GLES3::TextureStorage::get_singleton()->get_render_target(p_render_target);
+ 
+@@ -353,6 +407,32 @@ void RasterizerGLES3::_blit_render_target_to_screen(RID p_render_target, Display
+ 	}
+ 
+ 	Vector2i screen_rect_end = p_screen_rect.get_end();
++#ifdef NX_ZINK
++	if (rt->view_count == 1 && nx_stretch_init()) {
++		glBindFramebuffer(GL_FRAMEBUFFER, GLES3::TextureStorage::system_fbo);
++		glViewport(p_screen_rect.position.x, p_screen_rect.position.y, p_screen_rect.size.x, p_screen_rect.size.y);
++		glDisable(GL_BLEND);
++		glDisable(GL_DEPTH_TEST);
++		glDisable(GL_CULL_FACE);
++		glDisable(GL_SCISSOR_TEST);
++		glUseProgram(nx_stretch_program);
++		glUniform1f(nx_stretch_flip, flip_y ? 1.0f : 0.0f);
++		glActiveTexture(GL_TEXTURE0);
++		glBindTexture(GL_TEXTURE_2D, rt->color);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++		glBindVertexArray(nx_stretch_vao);
++		glDrawArrays(GL_TRIANGLES, 0, 3);
++		glBindVertexArray(0);
++		glBindTexture(GL_TEXTURE_2D, 0);
++		glUseProgram(0);
++		if (read_fbo != 0) {
++			glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
++			glDeleteFramebuffers(1, &read_fbo);
++		}
++		return;
++	}
++#endif
+ 	glBlitFramebuffer(0, 0, rt->size.x, rt->size.y,
+ 			p_screen_rect.position.x, flip_y ? screen_rect_end.y : p_screen_rect.position.y, screen_rect_end.x, flip_y ? p_screen_rect.position.y : screen_rect_end.y,
+ 			GL_COLOR_BUFFER_BIT, GL_NEAREST);
+diff --git a/drivers/gles3/rasterizer_scene_gles3.cpp b/drivers/gles3/rasterizer_scene_gles3.cpp
+index e6e7dd6..9883663 100644
+--- a/drivers/gles3/rasterizer_scene_gles3.cpp
++++ b/drivers/gles3/rasterizer_scene_gles3.cpp
+@@ -1715,6 +1715,79 @@ void RasterizerSceneGLES3::_setup_lights(const RenderDataGLES3 *p_render_data, b
+ 	glBindBuffer(GL_UNIFORM_BUFFER, 0);
+ }
+ 
++// Switch port: 3D upscale with contrast-adaptive sharpening (after AMD FidelityFX CAS), so a lower 3D resolution
++// keeps its edges. Sharpness from ProjectSettings "nx/sharpness" (0 = plain bilinear, 1 = strongest).
++static GLuint nx_cas_program = 0;
++static GLint nx_cas_u_src = -1, nx_cas_u_texel = -1, nx_cas_u_sharp = -1;
++
++static GLuint nx_cas_compile(GLenum type, const char *src) {
++	GLuint sh = glCreateShader(type);
++	glShaderSource(sh, 1, &src, nullptr);
++	glCompileShader(sh);
++	GLint ok = 0;
++	glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
++	if (!ok) {
++		char log[1024];
++		glGetShaderInfoLog(sh, sizeof(log), nullptr, log);
++		ERR_PRINT(String("CAS shader: ") + log);
++	}
++	return sh;
++}
++
++static bool nx_cas_init() {
++	if (nx_cas_program) {
++		return true;
++	}
++	static const char *vs =
++			"#version 300 es\n"
++			"layout(location = 0) in vec2 vertex;\n"
++			"out vec2 uv;\n"
++			"void main() { uv = vertex * 0.5 + 0.5; gl_Position = vec4(vertex, 0.0, 1.0); }\n";
++	static const char *fs =
++			"#version 300 es\n"
++			"precision mediump float;\n"
++			"uniform sampler2D src;\n"
++			"uniform vec2 texel;\n"
++			"uniform float sharp;\n"
++			"in vec2 uv;\n"
++			"out vec4 frag;\n"
++			"void main() {\n"
++			"  vec4 e4 = texture(src, uv);\n"
++			"  vec3 e = e4.rgb;\n"
++			"  vec3 b = texture(src, uv + vec2(0.0, -texel.y)).rgb;\n"
++			"  vec3 d = texture(src, uv + vec2(-texel.x, 0.0)).rgb;\n"
++			"  vec3 f = texture(src, uv + vec2(texel.x, 0.0)).rgb;\n"
++			"  vec3 h = texture(src, uv + vec2(0.0, texel.y)).rgb;\n"
++			"  vec3 mn = min(e, min(min(b, d), min(f, h)));\n"
++			"  vec3 mx = max(e, max(max(b, d), max(f, h)));\n"
++			"  vec3 amp = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, vec3(1e-4)), 0.0, 1.0));\n"
++			"  vec3 w = amp * mix(-0.125, -0.2, sharp);\n"
++			"  vec3 c = (e + (b + d + f + h) * w) / (1.0 + 4.0 * w);\n"
++			"  frag = vec4(clamp(c, 0.0, 1.0), e4.a);\n"
++			"}\n";
++	GLuint v = nx_cas_compile(GL_VERTEX_SHADER, vs);
++	GLuint f = nx_cas_compile(GL_FRAGMENT_SHADER, fs);
++	GLuint p = glCreateProgram();
++	glAttachShader(p, v);
++	glAttachShader(p, f);
++	glBindAttribLocation(p, 0, "vertex");
++	glLinkProgram(p);
++	glDeleteShader(v);
++	glDeleteShader(f);
++	GLint ok = 0;
++	glGetProgramiv(p, GL_LINK_STATUS, &ok);
++	if (!ok) {
++		ERR_PRINT("CAS program failed to link, using bilinear upscale.");
++		glDeleteProgram(p);
++		return false;
++	}
++	nx_cas_program = p;
++	nx_cas_u_src = glGetUniformLocation(p, "src");
++	nx_cas_u_texel = glGetUniformLocation(p, "texel");
++	nx_cas_u_sharp = glGetUniformLocation(p, "sharp");
++	return true;
++}
++
+ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_buffers, const CameraData *p_camera_data, const CameraData *p_prev_camera_data, const PagedArray<RenderGeometryInstance *> &p_instances, const PagedArray<RID> &p_lights, const PagedArray<RID> &p_reflection_probes, const PagedArray<RID> &p_voxel_gi_instances, const PagedArray<RID> &p_decals, const PagedArray<RID> &p_lightmaps, const PagedArray<RID> &p_fog_volumes, RID p_environment, RID p_camera_attributes, RID p_shadow_atlas, RID p_occluder_debug_tex, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, const RenderShadowData *p_render_shadows, int p_render_shadow_count, const RenderSDFGIData *p_render_sdfgi_regions, int p_render_sdfgi_region_count, const RenderSDFGIUpdateData *p_sdfgi_update_data, RenderingMethod::RenderInfo *r_render_info) {
+ 	GLES3::TextureStorage *texture_storage = GLES3::TextureStorage::get_singleton();
+ 	GLES3::Config *config = GLES3::Config::get_singleton();
+@@ -1798,6 +1871,13 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
+ 	Size2i screen_size;
+ 	screen_size.x = rb->width;
+ 	screen_size.y = rb->height;
++	// 3D resolution scaling: render into the smaller FBO, blit up at the end.
++	const bool scaled = rb->scaled;
++	const GLuint scene_fbo = scaled ? rb->scaled_fbo : rt->fbo;
++	if (scaled) {
++		screen_size.x = rb->internal_width;
++		screen_size.y = rb->internal_height;
++	}
+ 
+ 	bool use_wireframe = get_debug_draw_mode() == RS::VIEWPORT_DEBUG_DRAW_WIREFRAME;
+ 
+@@ -1916,8 +1996,14 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
+ 		}
+ 	}
+ 
+-	glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
+-	glViewport(0, 0, rb->width, rb->height);
++	glBindFramebuffer(GL_FRAMEBUFFER, scene_fbo);
++	glViewport(0, 0, screen_size.x, screen_size.y);
++	if (scaled && keep_color) {
++		// Bring the existing target content into the scaled buffer.
++		glBindFramebuffer(GL_READ_FRAMEBUFFER, rt->fbo);
++		glBlitFramebuffer(0, 0, rt->size.x, rt->size.y, 0, 0, screen_size.x, screen_size.y, GL_COLOR_BUFFER_BIT, GL_LINEAR);
++		glBindFramebuffer(GL_FRAMEBUFFER, scene_fbo);
++	}
+ 
+ 	glCullFace(GL_BACK);
+ 	glEnable(GL_CULL_FACE);
+@@ -2018,24 +2104,24 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
+ 
+ 	if (scene_state.used_screen_texture || scene_state.used_depth_texture) {
+ 		texture_storage->copy_scene_to_backbuffer(rt, scene_state.used_screen_texture, scene_state.used_depth_texture);
+-		glBindFramebuffer(GL_READ_FRAMEBUFFER, rt->fbo);
++		glBindFramebuffer(GL_READ_FRAMEBUFFER, scene_fbo);
+ 		glReadBuffer(GL_COLOR_ATTACHMENT0);
+ 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, rt->backbuffer_fbo);
+ 		if (scene_state.used_screen_texture) {
+-			glBlitFramebuffer(0, 0, rt->size.x, rt->size.y,
++			glBlitFramebuffer(0, 0, screen_size.x, screen_size.y,
+ 					0, 0, rt->size.x, rt->size.y,
+-					GL_COLOR_BUFFER_BIT, GL_NEAREST);
++					GL_COLOR_BUFFER_BIT, scaled ? GL_LINEAR : GL_NEAREST);
+ 			glActiveTexture(GL_TEXTURE0 + config->max_texture_image_units - 5);
+ 			glBindTexture(GL_TEXTURE_2D, rt->backbuffer);
+ 		}
+ 		if (scene_state.used_depth_texture) {
+-			glBlitFramebuffer(0, 0, rt->size.x, rt->size.y,
++			glBlitFramebuffer(0, 0, screen_size.x, screen_size.y,
+ 					0, 0, rt->size.x, rt->size.y,
+ 					GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+ 			glActiveTexture(GL_TEXTURE0 + config->max_texture_image_units - 6);
+ 			glBindTexture(GL_TEXTURE_2D, rt->backbuffer_depth);
+ 		}
+-		glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
++		glBindFramebuffer(GL_FRAMEBUFFER, scene_fbo);
+ 	}
+ 
+ 	RENDER_TIMESTAMP("Render 3D Transparent Pass");
+@@ -2051,6 +2137,41 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
+ 		glFrontFace(GL_CCW);
+ 	}
+ 
++	if (scaled) {
++		// Upscale the 3D image into the render target; 2D/UI is drawn on top afterwards at full size.
++		float sharpness = 0.0f;
++		if (ProjectSettings::get_singleton()->has_setting("nx/sharpness")) {
++			sharpness = CLAMP((float)GLOBAL_GET("nx/sharpness"), 0.0f, 1.0f);
++		}
++		if (sharpness > 0.0f && nx_cas_init()) {
++			glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
++			glViewport(0, 0, rt->size.x, rt->size.y);
++			glDisable(GL_BLEND);
++			glDisable(GL_DEPTH_TEST);
++			glDepthMask(GL_FALSE);
++			glDisable(GL_CULL_FACE);
++			glDisable(GL_SCISSOR_TEST);
++			glUseProgram(nx_cas_program);
++			glActiveTexture(GL_TEXTURE0);
++			glBindTexture(GL_TEXTURE_2D, rb->scaled_color);
++			glUniform1i(nx_cas_u_src, 0);
++			glUniform2f(nx_cas_u_texel, 1.0f / screen_size.x, 1.0f / screen_size.y);
++			glUniform1f(nx_cas_u_sharp, sharpness);
++			glBindVertexArray(sky_globals.screen_triangle_array);
++			glDrawArrays(GL_TRIANGLES, 0, 3);
++			glBindVertexArray(0);
++			glBindTexture(GL_TEXTURE_2D, 0);
++			glUseProgram(0);
++		} else {
++			glBindFramebuffer(GL_READ_FRAMEBUFFER, scene_fbo);
++			glReadBuffer(GL_COLOR_ATTACHMENT0);
++			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, rt->fbo);
++			glBlitFramebuffer(0, 0, screen_size.x, screen_size.y, 0, 0, rt->size.x, rt->size.y, GL_COLOR_BUFFER_BIT, GL_LINEAR);
++		}
++		glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
++		glViewport(0, 0, rt->size.x, rt->size.y);
++	}
++
+ 	if (rb.is_valid()) {
+ 		_render_buffers_debug_draw(rb, p_shadow_atlas, p_occluder_debug_tex);
+ 	}
+@@ -2660,6 +2781,11 @@ RasterizerSceneGLES3::RasterizerSceneGLES3() {
+ 		global_defines += "\n#define MAX_LIGHT_DATA_STRUCTS " + itos(config->max_renderable_lights) + "\n";
+ 		global_defines += "\n#define MAX_DIRECTIONAL_LIGHT_DATA_STRUCTS " + itos(MAX_DIRECTIONAL_LIGHTS) + "\n";
+ 		global_defines += "\n#define MAX_FORWARD_LIGHTS uint(" + itos(config->max_lights_per_object) + ")\n";
++		// Switch port (nx/no_specular): drop the specular part of every light (cheaper per-light loop on Zink/NVK).
++		if (ProjectSettings::get_singleton()->has_setting("nx/no_specular") && bool(GLOBAL_GET("nx/no_specular"))) {
++			global_defines += "\n#define SPECULAR_DISABLED\n";
++			print_line("[nx] scene shaders: specular disabled");
++		}
+ 		material_storage->shaders.scene_shader.initialize(global_defines);
+ 		scene_globals.shader_default_version = material_storage->shaders.scene_shader.version_create();
+ 		material_storage->shaders.scene_shader.version_bind_shader(scene_globals.shader_default_version, SceneShaderGLES3::MODE_COLOR);
+diff --git a/drivers/gles3/storage/render_scene_buffers_gles3.cpp b/drivers/gles3/storage/render_scene_buffers_gles3.cpp
+index 19bf57d..34006fc 100644
+--- a/drivers/gles3/storage/render_scene_buffers_gles3.cpp
++++ b/drivers/gles3/storage/render_scene_buffers_gles3.cpp
+@@ -40,8 +40,8 @@ RenderSceneBuffersGLES3::~RenderSceneBuffersGLES3() {
+ void RenderSceneBuffersGLES3::configure(RID p_render_target, const Size2i p_internal_size, const Size2i p_target_size, RS::ViewportScaling3DMode p_scaling_3d_mode, float p_fsr_sharpness, float p_texture_mipmap_bias, RS::ViewportMSAA p_msaa, RenderingServer::ViewportScreenSpaceAA p_screen_space_aa, bool p_use_taa, bool p_use_debanding, uint32_t p_view_count) {
+ 	GLES3::TextureStorage *texture_storage = GLES3::TextureStorage::get_singleton();
+ 
+-	//internal_size.x = p_internal_size.x; // ignore for now
+-	//internal_size.y = p_internal_size.y;
++	internal_width = p_internal_size.x;
++	internal_height = p_internal_size.y;
+ 	width = p_target_size.x;
+ 	height = p_target_size.y;
+ 	//scaling_3d_mode = p_scaling_3d_mode
+@@ -58,9 +58,52 @@ void RenderSceneBuffersGLES3::configure(RID p_render_target, const Size2i p_inte
+ 	GLES3::RenderTarget *rt = texture_storage->get_render_target(p_render_target);
+ 
+ 	is_transparent = rt->is_transparent;
++
++	// Bilinear mode passes the scaled size as the target too: upscale to the render target's real size.
++	if (rt->size.x > 0 && rt->size.y > 0) {
++		width = rt->size.x;
++		height = rt->size.y;
++	}
++
++	scaled = p_scaling_3d_mode != RS::VIEWPORT_SCALING_3D_MODE_OFF && internal_width > 0 && internal_height > 0 &&
++			(internal_width < width || internal_height < height) && view_count == 1;
++	if (scaled) {
++		glGenTextures(1, &scaled_color);
++		glBindTexture(GL_TEXTURE_2D, scaled_color);
++		glTexImage2D(GL_TEXTURE_2D, 0, rt->color_internal_format, internal_width, internal_height, 0, rt->color_format, rt->color_type, nullptr);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++		glGenRenderbuffers(1, &scaled_depth);
++		glBindRenderbuffer(GL_RENDERBUFFER, scaled_depth);
++		glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, internal_width, internal_height);
++		glGenFramebuffers(1, &scaled_fbo);
++		glBindFramebuffer(GL_FRAMEBUFFER, scaled_fbo);
++		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, scaled_color, 0);
++		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, scaled_depth);
++		if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++			WARN_PRINT("3D scaling FBO incomplete, rendering at full size.");
++			free_render_buffer_data();
++		}
++		glBindFramebuffer(GL_FRAMEBUFFER, GLES3::TextureStorage::system_fbo);
++		glBindTexture(GL_TEXTURE_2D, 0);
++		glBindRenderbuffer(GL_RENDERBUFFER, 0);
++	}
+ }
+ 
+ void RenderSceneBuffersGLES3::free_render_buffer_data() {
++	if (scaled_fbo) {
++		glDeleteFramebuffers(1, &scaled_fbo);
++	}
++	if (scaled_color) {
++		glDeleteTextures(1, &scaled_color);
++	}
++	if (scaled_depth) {
++		glDeleteRenderbuffers(1, &scaled_depth);
++	}
++	scaled_fbo = scaled_color = scaled_depth = 0;
++	scaled = false;
+ }
+ 
+ #endif // GLES3_ENABLED
+diff --git a/drivers/gles3/storage/render_scene_buffers_gles3.h b/drivers/gles3/storage/render_scene_buffers_gles3.h
+index d07a081..8b6bf5a 100644
+--- a/drivers/gles3/storage/render_scene_buffers_gles3.h
++++ b/drivers/gles3/storage/render_scene_buffers_gles3.h
+@@ -60,6 +60,12 @@ public:
+ 
+ 	bool is_transparent = false;
+ 
++	// 3D resolution scaling (Switch port): the scene renders into this smaller FBO, then is blitted up to the render target.
++	bool scaled = false;
++	GLuint scaled_fbo = 0;
++	GLuint scaled_color = 0;
++	GLuint scaled_depth = 0;
++
+ 	RID render_target;
+ 
+ 	//built-in textures used for ping pong image processing and blurring
+diff --git a/drivers/unix/net_socket_posix.cpp b/drivers/unix/net_socket_posix.cpp
+index b46af01..fe00781 100644
+--- a/drivers/unix/net_socket_posix.cpp
++++ b/drivers/unix/net_socket_posix.cpp
+@@ -50,7 +50,7 @@
+ #include <sys/types.h>
+ #include <unistd.h>
+ 
+-#ifdef WEB_ENABLED
++#if defined(WEB_ENABLED) || defined(HORIZON_ENABLED)
+ #include <arpa/inet.h>
+ #endif
+ 
+@@ -285,11 +285,15 @@ _FORCE_INLINE_ Error NetSocketPosix::_change_multicast_group(IPAddress p_ip, Str
+ 		memcpy(&greq.imr_interface, if_ip.get_ipv4(), 4);
+ 		ret = setsockopt(_sock, level, sock_opt, (const char *)&greq, sizeof(greq));
+ 	} else {
++#ifdef HORIZON_ENABLED
++		return ERR_UNAVAILABLE; // No IPv6 multicast on Horizon.
++#else
+ 		struct ipv6_mreq greq;
+ 		int sock_opt = p_add ? IPV6_ADD_MEMBERSHIP : IPV6_DROP_MEMBERSHIP;
+ 		memcpy(&greq.ipv6mr_multiaddr, p_ip.get_ipv6(), 16);
+ 		greq.ipv6mr_interface = if_v6id;
+ 		ret = setsockopt(_sock, level, sock_opt, (const char *)&greq, sizeof(greq));
++#endif
+ 	}
+ 	ERR_FAIL_COND_V(ret != 0, FAILED);
+ 
+diff --git a/drivers/unix/os_unix.cpp b/drivers/unix/os_unix.cpp
+index 1ffacdf..b7d467b 100644
+--- a/drivers/unix/os_unix.cpp
++++ b/drivers/unix/os_unix.cpp
+@@ -467,12 +467,14 @@ Dictionary OS_Unix::get_memory_info() const {
+ 	}
+ #endif
+ 
++#ifndef HORIZON_ENABLED
+ 	rlimit stackinfo = {};
+ 	getrlimit(RLIMIT_STACK, &stackinfo);
+ 
+ 	if (stackinfo.rlim_cur != 0) {
+ 		meminfo["stack"] = (int64_t)stackinfo.rlim_cur;
+ 	}
++#endif
+ 
+ 	return meminfo;
+ }
+diff --git a/drivers/vulkan/SCsub b/drivers/vulkan/SCsub
+index a076c0a..037941d 100644
+--- a/drivers/vulkan/SCsub
++++ b/drivers/vulkan/SCsub
+@@ -21,6 +21,8 @@ elif env["platform"] == "linuxbsd" and env["x11"]:
+     env.AppendUnique(CPPDEFINES=["VK_USE_PLATFORM_XLIB_KHR"])
+ elif env["platform"] == "macos":
+     env.AppendUnique(CPPDEFINES=["VK_USE_PLATFORM_MACOS_MVK"])
++elif env["platform"] == "switch":
++    env.AppendUnique(CPPDEFINES=["VK_USE_PLATFORM_VI_NN"])
+ elif env["platform"] == "windows":
+     env.AppendUnique(CPPDEFINES=["VK_USE_PLATFORM_WIN32_KHR"])
+ 
+diff --git a/platform/switch/SCsub b/platform/switch/SCsub
+new file mode 100644
+index 0000000..c3ddefb
+--- /dev/null
++++ b/platform/switch/SCsub
+@@ -0,0 +1,37 @@
++#!/usr/bin/env python
++
++Import("env")
++
++files = [
++    "godot_switch.cpp",
++    "os_switch.cpp",
++    "display_server_switch.cpp",
++    "audio_driver_switch.cpp",
++    "posix_stubs.c",
++]
++if env["vulkan"]:
++    files += ["vulkan_context_switch.cpp", "nvk_compat.c"]
++if env["zink"]:
++    files += ["nvk_compat.c"]
++    if not env["lsfg"]:
++        env_hook = env.Clone()
++        env_hook.Prepend(CPPPATH=["#thirdparty/vulkan/include"])
++        files += [env_hook.Object("nx_zink_hook.cpp")]
++if env["lsfg"]:
++    # Zink + lsfg-vk (GPL-3.0-or-later, third_party/lsfg-vk, from the P.T. port; needs C++20 and exceptions).
++    import glob, os
++
++    lsfg = os.path.abspath(Dir("#").abspath + "/../third_party/lsfg-vk").replace("\\", "/")
++    env_lsfg = env.Clone()
++    env_lsfg["CXXFLAGS"] = [f for f in env_lsfg["CXXFLAGS"] if not str(f).startswith("-std=")] + ["-std=gnu++20", "-fexceptions", "-w"]
++    env_lsfg.Prepend(CPPPATH=["#thirdparty/vulkan/include", "#thirdparty/vulkan/include/vulkan",
++                              lsfg + "/lsfg-vk-backend/include", lsfg + "/lsfg-vk-common/include",
++                              lsfg + "/lsfg-vk-backend/src", lsfg + "/lsfg-vk-common/src", "#platform/switch/compat"])
++    srcs = glob.glob(lsfg + "/lsfg-vk-backend/src/**/*.cpp", recursive=True) + glob.glob(lsfg + "/lsfg-vk-common/src/**/*.cpp", recursive=True)
++    objdir = Dir("#bin/obj_lsfg").abspath
++    for src in srcs:
++        rel = os.path.relpath(src, lsfg).replace("\\", "/").replace("/", "_")[:-4]
++        files += [env_lsfg.Object(objdir + "/" + rel + env["OBJSUFFIX"], src)]
++    files += [env_lsfg.Object("nx_zink_hook.cpp")]
++
++prog = env.add_program("#bin/godot", files)
+diff --git a/platform/switch/audio_driver_switch.cpp b/platform/switch/audio_driver_switch.cpp
+new file mode 100644
+index 0000000..2e9c375
+--- /dev/null
++++ b/platform/switch/audio_driver_switch.cpp
+@@ -0,0 +1,87 @@
++#include "audio_driver_switch.h"
++
++#include <malloc.h>
++#include <string.h>
++#include "nx.h"
++
++static constexpr size_t align_up(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
++
++Error AudioDriverSwitch::init() {
++	if (R_FAILED(audoutInitialize())) {
++		return FAILED;
++	}
++	if (R_FAILED(audoutStartAudioOut())) {
++		audoutExit();
++		return FAILED;
++	}
++	mix_rate = audoutGetSampleRate();
++	if (mix_rate <= 0) {
++		mix_rate = 48000;
++	}
++	mix_buf = (int32_t *)memalloc(sizeof(int32_t) * BUFFER_FRAMES * CHANNELS);
++	size_t data_size = BUFFER_FRAMES * CHANNELS * sizeof(int16_t);
++	size_t buf_size = align_up(data_size, 0x1000);
++	AudioOutBuffer *bufs = (AudioOutBuffer *)memalloc(sizeof(AudioOutBuffer) * BUFFER_COUNT);
++	for (int i = 0; i < BUFFER_COUNT; i++) {
++		out_data[i] = (int16_t *)memalign(0x1000, buf_size);
++		memset(out_data[i], 0, buf_size);
++		bufs[i].next = nullptr;
++		bufs[i].buffer = out_data[i];
++		bufs[i].buffer_size = buf_size;
++		bufs[i].data_size = data_size;
++		bufs[i].data_offset = 0;
++	}
++	out_bufs = bufs;
++	active = true;
++	return OK;
++}
++
++void AudioDriverSwitch::thread_func(void *p_udata) {
++	AudioDriverSwitch *ad = (AudioDriverSwitch *)p_udata;
++	AudioOutBuffer *bufs = (AudioOutBuffer *)ad->out_bufs;
++
++	for (int i = 0; i < BUFFER_COUNT; i++) {
++		audoutAppendAudioOutBuffer(&bufs[i]);
++	}
++
++	while (!ad->exit_thread.is_set()) {
++		AudioOutBuffer *released = nullptr;
++		u32 count = 0;
++		if (R_FAILED(audoutWaitPlayFinish(&released, &count, 100000000ULL)) || !released) {
++			continue;
++		}
++		ad->lock();
++		ad->audio_server_process(BUFFER_FRAMES, ad->mix_buf);
++		ad->unlock();
++		int16_t *dst = (int16_t *)released->buffer;
++		for (int i = 0; i < BUFFER_FRAMES * CHANNELS; i++) {
++			dst[i] = int16_t(ad->mix_buf[i] >> 16);
++		}
++		armDCacheFlush(dst, released->data_size);
++		audoutAppendAudioOutBuffer(released);
++	}
++}
++
++void AudioDriverSwitch::start() {
++	if (active) {
++		thread.start(AudioDriverSwitch::thread_func, this);
++	}
++}
++
++void AudioDriverSwitch::finish() {
++	if (!active) {
++		return;
++	}
++	exit_thread.set();
++	if (thread.is_started()) {
++		thread.wait_to_finish();
++	}
++	audoutStopAudioOut();
++	audoutExit();
++	for (int i = 0; i < BUFFER_COUNT; i++) {
++		free(out_data[i]);
++	}
++	memfree(out_bufs);
++	memfree(mix_buf);
++	active = false;
++}
+diff --git a/platform/switch/audio_driver_switch.h b/platform/switch/audio_driver_switch.h
+new file mode 100644
+index 0000000..182880f
+--- /dev/null
++++ b/platform/switch/audio_driver_switch.h
+@@ -0,0 +1,36 @@
++#ifndef AUDIO_DRIVER_SWITCH_H
++#define AUDIO_DRIVER_SWITCH_H
++
++#include "core/os/mutex.h"
++#include "core/os/thread.h"
++#include "core/templates/safe_refcount.h"
++#include "servers/audio_server.h"
++
++class AudioDriverSwitch : public AudioDriver {
++	enum { BUFFER_FRAMES = 1024, BUFFER_COUNT = 3, CHANNELS = 2 };
++
++	Thread thread;
++	Mutex mutex;
++	SafeFlag exit_thread;
++	bool active = false;
++	int mix_rate = 48000;
++
++	int32_t *mix_buf = nullptr;
++	int16_t *out_data[BUFFER_COUNT] = {};
++	void *out_bufs = nullptr; // AudioOutBuffer[BUFFER_COUNT]
++
++	static void thread_func(void *p_udata);
++
++public:
++	const char *get_name() const override { return "Switch"; }
++	Error init() override;
++	void start() override;
++	int get_mix_rate() const override { return mix_rate; }
++	SpeakerMode get_speaker_mode() const override { return SPEAKER_MODE_STEREO; }
++	float get_latency() override { return float(BUFFER_FRAMES * BUFFER_COUNT) / mix_rate; }
++	void lock() override { mutex.lock(); }
++	void unlock() override { mutex.unlock(); }
++	void finish() override;
++};
++
++#endif
+diff --git a/platform/switch/compat/dlfcn.h b/platform/switch/compat/dlfcn.h
+new file mode 100644
+index 0000000..a2f36a8
+--- /dev/null
++++ b/platform/switch/compat/dlfcn.h
+@@ -0,0 +1,10 @@
++#pragma once
++// Horizon has no dynamic loader; GDExtension libraries are unavailable.
++#define RTLD_NOW 2
++#define RTLD_LAZY 1
++#define RTLD_LOCAL 0
++#define RTLD_GLOBAL 0x100
++static inline void *dlopen(const char *, int) { return 0; }
++static inline int dlclose(void *) { return 0; }
++static inline void *dlsym(void *, const char *) { return 0; }
++static inline char *dlerror(void) { return (char *)"dynamic libraries are not supported on Switch"; }
+diff --git a/platform/switch/compat/ifaddrs.h b/platform/switch/compat/ifaddrs.h
+new file mode 100644
+index 0000000..388b458
+--- /dev/null
++++ b/platform/switch/compat/ifaddrs.h
+@@ -0,0 +1,13 @@
++#pragma once
++#include <sys/socket.h>
++struct ifaddrs {
++	struct ifaddrs *ifa_next;
++	char *ifa_name;
++	unsigned int ifa_flags;
++	struct sockaddr *ifa_addr;
++	struct sockaddr *ifa_netmask;
++	void *ifa_data;
++};
++static inline int getifaddrs(struct ifaddrs **ifap) { *ifap = 0; return -1; }
++static inline unsigned int if_nametoindex(const char *) { return 0; }
++static inline void freeifaddrs(struct ifaddrs *) {}
+diff --git a/platform/switch/compat/syslog.h b/platform/switch/compat/syslog.h
+new file mode 100644
+index 0000000..d707350
+--- /dev/null
++++ b/platform/switch/compat/syslog.h
+@@ -0,0 +1,7 @@
++#pragma once
++#include <stdarg.h>
++#define LOG_ERR 3
++#define LOG_WARNING 4
++#define LOG_INFO 6
++static inline void syslog(int, const char *, ...) {}
++static inline void vsyslog(int, const char *, va_list) {}
+diff --git a/platform/switch/detect.py b/platform/switch/detect.py
+new file mode 100644
+index 0000000..c34f3a7
+--- /dev/null
++++ b/platform/switch/detect.py
+@@ -0,0 +1,144 @@
++import os
++import sys
++
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    from SCons import Environment
++
++
++def get_dkp():
++    d = os.environ.get("DEVKITPRO", "")
++    if not d or d.startswith("/opt"):
++        # Windows host: msys-style DEVKITPRO is useless to native Python.
++        for c in ["C:/devkitPro", "C:\\devkitPro"]:
++            if os.path.isdir(c):
++                return c.replace("\\", "/")
++    return d
++
++
++def get_name():
++    return "Switch"
++
++
++def can_build():
++    return os.path.isdir(get_dkp() + "/libnx")
++
++
++def get_opts():
++    from SCons.Variables import BoolVariable
++
++    return [
++        BoolVariable("zink", "GL on nxvk's Zink (OpenGL over Vulkan); no = devkitPro's Mesa nouveau GL", True),
++        BoolVariable("lsfg", "LSFG frame generation in the Zink build (needs the user's Lossless.dll at runtime)", True),
++    ]
++
++
++def get_flags():
++    return [
++        ("arch", "arm64"),
++        ("target", "template_release"),
++        ("vulkan", False),
++        ("use_volk", True),
++        ("opengl3", True),
++        ("openxr", False),
++        ("builtin_pcre2_with_jit", False),
++        ("module_mono_enabled", False),
++        ("module_upnp_enabled", False),
++        ("module_webrtc_enabled", False),
++        ("module_websocket_enabled", False),
++        ("module_mbedtls_enabled", False),
++        ("module_text_server_adv_enabled", True),
++        ("module_text_server_fb_enabled", False),
++        ("module_camera_enabled", False),
++        ("module_raycast_enabled", False),
++        ("module_denoise_enabled", False),
++        ("module_lightmapper_rd_enabled", False),
++        ("module_theora_enabled", True),
++        ("module_navigation_enabled", True),
++    ]
++
++
++def configure(env: "Environment"):
++    if env["arch"] != "arm64":
++        print("Switch only supports arm64")
++        sys.exit(255)
++
++    dkp = get_dkp()
++    a64 = dkp + "/devkitA64/bin/aarch64-none-elf-"
++    exe = ".exe" if os.name == "nt" else ""
++    env["CC"] = a64 + "gcc" + exe
++    env["CXX"] = a64 + "g++" + exe
++    env["LINK"] = a64 + "g++" + exe
++    env["AR"] = a64 + "gcc-ar" + exe
++    env["RANLIB"] = a64 + "gcc-ranlib" + exe
++    env["AS"] = a64 + "as" + exe
++    env["ENV"]["DEVKITPRO"] = dkp
++    env["PROGSUFFIX"] = ".elf"
++    env["ENV"]["PATH"] = dkp + "/devkitA64/bin" + os.pathsep + env["ENV"]["PATH"]
++    # Long command lines on Windows.
++    # Windows' 32K command-line limit: pass long ar/link lines through response files.
++    # GNU tools treat backslashes in @files as escapes, so use forward slashes.
++    env["MAXLINELENGTH"] = 8000
++    env["TEMPFILEARGESCFUNC"] = lambda arg: str(arg).replace("\\", "/")
++    env["ARCOM"] = "${TEMPFILE('$AR $ARFLAGS $TARGET $SOURCES','$ARCOMSTR')}"
++    # nxvk goes between the objects and the libraries: whole archive for the driver, then its support libs.
++    env["NXVK_LINK"] = ""
++    env["LINKCOM"] = "${TEMPFILE('$LINK -o $TARGET $LINKFLAGS $__RPATH $SOURCES $_LIBDIRFLAGS $NXVK_LINK $_LIBFLAGS','$LINKCOMSTR')}"
++
++    arch = ["-march=armv8-a+crc+crypto", "-mtune=cortex-a57", "-mtp=soft", "-fPIE"]
++    env.Append(CCFLAGS=arch + ["-ffunction-sections", "-fdata-sections"])
++    env.Append(CPPDEFINES=["__SWITCH__", "HORIZON_ENABLED", "UNIX_ENABLED", "PTHREAD_NO_RENAME"])
++    env.Append(CPPPATH=[dkp + "/libnx/include", dkp + "/portlibs/switch/include", "#platform/switch", "#platform/switch/compat"])
++    env.Append(LIBPATH=[dkp + "/libnx/lib", dkp + "/portlibs/switch/lib"])
++    env.Append(LINKFLAGS=arch + ["-specs=" + dkp + "/libnx/switch.specs", "-Wl,--gc-sections"])
++    # Mesa GL (devkitPro) and nxvk each carry their own Mesa: one or the other per build.
++    if env["opengl3"]:
++        env.Append(CPPDEFINES=["GLES3_ENABLED"])
++        if not env["zink"]:
++            env.Append(LIBS=["EGL", "GLESv2", "glapi", "drm_nouveau"])
++        if env["vulkan"]:
++            print("Switch: build either vulkan=yes or opengl3=yes, not both (two Mesa copies clash)")
++            sys.exit(255)
++    env.Append(LIBS=["nx", "pthread", "m"])
++
++    if env["zink"]:
++        # OpenGL from nxvk: Zink (Gallium GL over Vulkan) + EGL + NVK, all static (nxvk-gl portlib layout).
++        if env["vulkan"] or not env["opengl3"]:
++            print("Switch: zink=yes needs opengl3=yes vulkan=no")
++            sys.exit(255)
++        here = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
++        gl = os.environ.get("NXVK_GL_PKG", here + "/../../../../nxvk-pkg-gl").replace("\\", "/")  # default: next to the repo
++        expat = here + "/../../../third_party/nxvk"
++        # libnvk_gl_hooked.a: libnvk_gl.a with Zink's two Vulkan entry points renamed to nx_hook_* (nx_zink_hook.cpp):
++        #   objcopy --redefine-sym vk_icdGetInstanceProcAddr=nx_hook_GetInstanceProcAddr
++        #           --redefine-sym vk_common_GetDeviceProcAddr=nx_hook_GetDeviceProcAddr libnvk_gl.a libnvk_gl_hooked.a
++        if not os.path.isfile(gl + "/lib/libnvk_gl_hooked.a"):
++            print("nxvk-gl package (libnvk_gl_hooked.a) not found at %s (set NXVK_GL_PKG)" % gl)
++            sys.exit(255)
++        env.Append(CPPDEFINES=["NX_ZINK"])
++        if env["lsfg"]:
++            env.Append(CPPDEFINES=["NX_ZINK_LSFG"])
++        env["NXVK_LINK"] = ("-L%s/lib -L%s -Wl,--whole-archive -lnvk_gl_hooked -lnvk -Wl,--no-whole-archive "
++                            "-Wl,--start-group -lnvk_support -lz -lexpat -Wl,--end-group -Wl,-u,vk_icdGetInstanceProcAddr") % (gl, expat)
++
++    if env["lsfg"] and not env["zink"]:
++        # The nouveau GL build has no way to hand frames to Vulkan without a full stall: frame generation is Zink only.
++        env["lsfg"] = False
++
++    if env["vulkan"]:
++        # Experimental, unmaintained: Godot's Mobile renderer on nxvk (Environment fog hangs, slower than GL). Needs zink=no.
++        env.Append(CPPDEFINES=["VULKAN_ENABLED"])
++        # nxvk (Mesa NVK for the Switch, GPL-2.0-or-later, github.com/PalindromicBreadLoaf/nxvk), linked statically.
++        here = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
++        nxvk = os.environ.get("NXVK_PKG", here + "/../../../../nxvk-pkg").replace("\\", "/")
++        expat = here + "/../../../third_party/nxvk"
++        if not os.path.isfile(nxvk + "/lib/libnvk.a"):
++            print("nxvk package not found at %s (set NXVK_PKG), or build with vulkan=no" % nxvk)
++            sys.exit(255)
++        env["NXVK_LINK"] = ("-L%s/lib -L%s -Wl,--whole-archive -lnvk -Wl,--no-whole-archive "
++                            "-Wl,--start-group -lnvk_support -lz -Wl,--end-group -lexpat -Wl,-u,vk_icdGetInstanceProcAddr") % (nxvk, expat)
++
++    # Thread-safe statics etc. come from newlib + libnx pthreads.
++    env.Append(CCFLAGS=["-Wno-psabi"])
++    env.Append(CXXFLAGS=["-Wno-template-id-cdtor"])
+diff --git a/platform/switch/display_server_switch.cpp b/platform/switch/display_server_switch.cpp
+new file mode 100644
+index 0000000..46a3965
+--- /dev/null
++++ b/platform/switch/display_server_switch.cpp
+@@ -0,0 +1,504 @@
++#include "display_server_switch.h"
++
++#include "core/config/project_settings.h"
++#include "core/input/input.h"
++#include "core/os/os.h"
++#include "core/os/time.h"
++#include "core/io/file_access.h"
++#include "scene/resources/texture.h"
++
++#ifdef GLES3_ENABLED
++#include "drivers/gles3/rasterizer_gles3.h"
++#endif
++#include "servers/rendering/dummy/rasterizer_dummy.h"
++
++#ifdef VULKAN_ENABLED
++#include "drivers/vulkan/rendering_device_vulkan.h"
++#include "servers/rendering/renderer_rd/renderer_compositor_rd.h"
++#include "vulkan_context_switch.h"
++#endif
++
++
++static DisplayServerSwitch *ds_singleton = nullptr;
++
++// Nintendo layout: A (right) confirms, B (bottom) cancels. Godot's JoyButton::A is "confirm".
++static const struct {
++	u64 mask;
++	JoyButton button;
++} button_map[] = {
++	{ HidNpadButton_A, JoyButton::A },
++	{ HidNpadButton_B, JoyButton::B },
++	{ HidNpadButton_Y, JoyButton::X },
++	{ HidNpadButton_X, JoyButton::Y },
++	{ HidNpadButton_Minus, JoyButton::BACK },
++	{ HidNpadButton_Plus, JoyButton::START },
++	{ HidNpadButton_StickL, JoyButton::LEFT_STICK },
++	{ HidNpadButton_StickR, JoyButton::RIGHT_STICK },
++	{ HidNpadButton_L, JoyButton::LEFT_SHOULDER },
++	{ HidNpadButton_R, JoyButton::RIGHT_SHOULDER },
++	{ HidNpadButton_Up, JoyButton::DPAD_UP },
++	{ HidNpadButton_Down, JoyButton::DPAD_DOWN },
++	{ HidNpadButton_Left, JoyButton::DPAD_LEFT },
++	{ HidNpadButton_Right, JoyButton::DPAD_RIGHT },
++};
++
++void DisplayServerSwitch::_dispatch_input_event(const Ref<InputEvent> &p_event) {
++	if (!ds_singleton) {
++		return;
++	}
++	Callable cb = ds_singleton->input_event_callback;
++	if (!cb.is_null()) {
++		Variant ev = p_event;
++		Variant *evp = &ev;
++		Variant ret;
++		Callable::CallError ce;
++		cb.callp((const Variant **)&evp, 1, ret, ce);
++	}
++}
++
++void DisplayServerSwitch::_send_window_event(WindowEvent p_event) {
++	if (!window_event_callback.is_null()) {
++		Variant event = int(p_event);
++		Variant *eventp = &event;
++		Variant ret;
++		Callable::CallError ce;
++		window_event_callback.callp((const Variant **)&eventp, 1, ret, ce);
++	}
++}
++
++void DisplayServerSwitch::_applet_hook(AppletHookType p_hook, void *p_param) {
++	DisplayServerSwitch *ds = (DisplayServerSwitch *)p_param;
++	if (p_hook == AppletHookType_OnFocusState) {
++		bool now = appletGetFocusState() == AppletFocusState_InFocus;
++		if (now != ds->focused) {
++			ds->focused = now;
++			ds->_send_window_event(now ? WINDOW_EVENT_FOCUS_IN : WINDOW_EVENT_FOCUS_OUT);
++		}
++	} else if (p_hook == AppletHookType_OnExitRequest) {
++		ds->_send_window_event(WINDOW_EVENT_CLOSE_REQUEST);
++	}
++}
++
++#ifdef GLES3_ENABLED
++bool DisplayServerSwitch::_init_egl() {
++#ifdef NX_ZINK
++	// GL is Zink on nxvk: NVK still refuses to create a device without this.
++	setenv("NVK_I_WANT_A_BROKEN_VULKAN_DRIVER", "1", 1);
++#ifdef NX_ZINK_LSFG
++	{
++		// Frame generation is on unless the menu turned it off (it creates nx_lsfg_off); it also needs Lossless.dll.
++		extern int nx_zink_fg_wanted;
++		FILE *f = fopen("sdmc:/switch/buckshot_roulette/nx_lsfg_off", "r");
++		nx_zink_fg_wanted = f ? 0 : 1;
++		if (f) {
++			fclose(f);
++		}
++		printf("[nx] Zink build, frame generation %s\n", nx_zink_fg_wanted ? "on" : "off (nx_lsfg_off)");
++	}
++#endif
++#endif
++	egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
++	if (egl_display == EGL_NO_DISPLAY || !eglInitialize(egl_display, nullptr, nullptr)) {
++		return false;
++	}
++	if (!eglBindAPI(EGL_OPENGL_ES_API)) {
++		return false;
++	}
++	const EGLint cfg_attrs[] = {
++		EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
++		EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
++		EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
++		EGL_DEPTH_SIZE, 24, EGL_STENCIL_SIZE, 8,
++		EGL_NONE
++	};
++	EGLConfig cfg;
++	EGLint n = 0;
++	if (!eglChooseConfig(egl_display, cfg_attrs, &cfg, 1, &n) || n == 0) {
++		return false;
++	}
++	NWindow *win = nwindowGetDefault();
++	nwindowSetDimensions(win, size.x, size.y);
++	egl_surface = eglCreateWindowSurface(egl_display, cfg, win, nullptr);
++	if (egl_surface == EGL_NO_SURFACE) {
++		return false;
++	}
++	static const EGLint ctx_attrs[] = {
++		EGL_CONTEXT_MAJOR_VERSION, 3,
++		EGL_CONTEXT_MINOR_VERSION, 2,
++		EGL_NONE
++	};
++	egl_context = eglCreateContext(egl_display, cfg, EGL_NO_CONTEXT, ctx_attrs);
++	if (egl_context == EGL_NO_CONTEXT) {
++		return false;
++	}
++	eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context);
++	return true;
++}
++#endif
++
++DisplayServerSwitch::DisplayServerSwitch(const String &p_rendering_driver, WindowMode p_window_mode, VSyncMode p_vsync_mode, uint32_t p_flags, const Point2i *p_position, const Size2i &p_resolution, int p_screen, Error &r_error) {
++	ds_singleton = this;
++	r_error = OK;
++
++	// Render at 1080p when docked, 720p handheld. The resolution is fixed at startup.
++	size = appletGetOperationMode() == AppletOperationMode_Console ? Size2i(1920, 1080) : Size2i(1280, 720);
++
++	padConfigureInput(1, HidNpadStyleSet_NpadStandard);
++	padInitializeDefault(&pad);
++	hidInitializeTouchScreen();
++	appletHook(&applet_cookie, _applet_hook, this);
++	appletSetFocusHandlingMode(AppletFocusHandlingMode_SuspendHomeSleepNotify);
++
++	rendering_driver = p_rendering_driver;
++	bool ok = false;
++#ifdef VULKAN_ENABLED
++	if (p_rendering_driver == "vulkan") {
++		NWindow *win = nwindowGetDefault();
++		nwindowSetDimensions(win, size.x, size.y);
++		context_vulkan = memnew(VulkanContextSwitch);
++		if (context_vulkan->initialize() != OK || context_vulkan->window_create(win, p_vsync_mode, size.x, size.y) != OK) {
++			memdelete(context_vulkan);
++			context_vulkan = nullptr;
++		} else {
++			rendering_device_vulkan = memnew(RenderingDeviceVulkan);
++			rendering_device_vulkan->initialize(context_vulkan);
++			RendererCompositorRD::make_current();
++			ok = true;
++		}
++	}
++#endif
++#ifdef GLES3_ENABLED
++	if (p_rendering_driver == "opengl3" && _init_egl()) {
++		RasterizerGLES3::make_current();
++		window_set_vsync_mode(p_vsync_mode);
++		ok = true;
++	}
++#endif
++	if (!ok) {
++		OS::get_singleton()->alert("Could not initialize the " + p_rendering_driver + " video driver.", "Video driver error");
++		r_error = ERR_UNAVAILABLE;
++		return;
++	}
++
++	cursor_pos = Vector2(size) / 2;
++	mouse_pos = Point2i(cursor_pos);
++	ProjectSettings::get_singleton()->set_setting("nx/cursor_visible", true);
++	Input::get_singleton()->set_event_dispatch_function(_dispatch_input_event);
++}
++
++DisplayServerSwitch::~DisplayServerSwitch() {
++	appletUnhook(&applet_cookie);
++#ifdef VULKAN_ENABLED
++	if (rendering_device_vulkan) {
++		rendering_device_vulkan->finalize();
++		memdelete(rendering_device_vulkan);
++	}
++	if (context_vulkan) {
++		memdelete(context_vulkan);
++	}
++#endif
++#ifdef GLES3_ENABLED
++	if (egl_display != EGL_NO_DISPLAY) {
++		eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++		if (egl_context != EGL_NO_CONTEXT) {
++			eglDestroyContext(egl_display, egl_context);
++		}
++		if (egl_surface != EGL_NO_SURFACE) {
++			eglDestroySurface(egl_display, egl_surface);
++		}
++		eglTerminate(egl_display);
++	}
++#endif
++	ds_singleton = nullptr;
++}
++
++DisplayServer *DisplayServerSwitch::create_func(const String &p_rendering_driver, WindowMode p_window_mode, VSyncMode p_vsync_mode, uint32_t p_flags, const Point2i *p_position, const Size2i &p_resolution, int p_screen, Error &r_error) {
++	return memnew(DisplayServerSwitch(p_rendering_driver, p_window_mode, p_vsync_mode, p_flags, p_position, p_resolution, p_screen, r_error));
++}
++
++Vector<String> DisplayServerSwitch::get_rendering_drivers_func() {
++	Vector<String> drivers;
++#ifdef VULKAN_ENABLED
++	drivers.push_back("vulkan");
++#endif
++	drivers.push_back("opengl3");
++	return drivers;
++}
++
++void DisplayServerSwitch::register_switch_driver() {
++	register_create_function("switch", create_func, get_rendering_drivers_func);
++}
++
++void DisplayServerSwitch::_poll_joypad() {
++	padUpdate(&pad);
++	bool connected = padIsConnected(&pad);
++	if (connected != joy_connected) {
++		joy_connected = connected;
++		Input::get_singleton()->joy_connection_changed(0, connected, "Nintendo Switch Controller", "");
++		if (!connected) {
++			prev_buttons = 0;
++			for (float &a : prev_axes) {
++				a = 0;
++			}
++		}
++	}
++	if (!connected) {
++		return;
++	}
++	Input *input = Input::get_singleton();
++	u64 buttons = padGetButtons(&pad);
++	u64 changed = buttons ^ prev_buttons;
++	for (const auto &m : button_map) {
++		if (changed & m.mask) {
++			input->joy_button(0, m.button, (buttons & m.mask) != 0);
++		}
++	}
++	_poll_cursor(buttons, prev_buttons);
++	prev_buttons = buttons;
++
++	HidAnalogStickState l = padGetStickPos(&pad, 0);
++	HidAnalogStickState r = padGetStickPos(&pad, 1);
++	float axes[6] = {
++		l.x / float(JOYSTICK_MAX), -l.y / float(JOYSTICK_MAX),
++		r.x / float(JOYSTICK_MAX), -r.y / float(JOYSTICK_MAX),
++		(buttons & HidNpadButton_ZL) ? 1.0f : 0.0f,
++		(buttons & HidNpadButton_ZR) ? 1.0f : 0.0f,
++	};
++	for (int i = 0; i < 6; i++) {
++		if (axes[i] != prev_axes[i]) {
++			input->joy_axis(0, JoyAxis(i), axes[i]);
++			prev_axes[i] = axes[i];
++		}
++	}
++}
++
++void DisplayServerSwitch::_poll_touch() {
++	HidTouchScreenState state = {};
++	if (!hidGetTouchScreenStates(&state, 1)) {
++		return;
++	}
++	// Touch panel is always 1280x720; scale to the render size.
++	float sx = size.x / 1280.0f, sy = size.y / 720.0f;
++
++	// Releases: fingers present before but gone now.
++	for (s32 i = 0; i < prev_touch.count; i++) {
++		bool still = false;
++		for (s32 j = 0; j < state.count; j++) {
++			if (state.touches[j].finger_id == prev_touch.touches[i].finger_id) {
++				still = true;
++			}
++		}
++		if (!still) {
++			Ref<InputEventScreenTouch> ev;
++			ev.instantiate();
++			ev->set_index(prev_touch.touches[i].finger_id);
++			ev->set_position(Vector2(prev_touch.touches[i].x * sx, prev_touch.touches[i].y * sy));
++			ev->set_pressed(false);
++			Input::get_singleton()->parse_input_event(ev);
++		}
++	}
++	for (s32 j = 0; j < state.count; j++) {
++		const HidTouchState &t = state.touches[j];
++		Vector2 pos(t.x * sx, t.y * sy);
++		const HidTouchState *old = nullptr;
++		for (s32 i = 0; i < prev_touch.count; i++) {
++			if (prev_touch.touches[i].finger_id == t.finger_id) {
++				old = &prev_touch.touches[i];
++			}
++		}
++		if (!old) {
++			Ref<InputEventScreenTouch> ev;
++			ev.instantiate();
++			ev->set_index(t.finger_id);
++			ev->set_position(pos);
++			ev->set_pressed(true);
++			Input::get_singleton()->parse_input_event(ev);
++		} else if (old->x != t.x || old->y != t.y) {
++			Ref<InputEventScreenDrag> ev;
++			ev.instantiate();
++			ev->set_index(t.finger_id);
++			ev->set_position(pos);
++			ev->set_relative(pos - Vector2(old->x * sx, old->y * sy));
++			Input::get_singleton()->parse_input_event(ev);
++		}
++		mouse_pos = Point2i(pos);
++		cursor_pos = pos;
++	}
++	prev_touch = state;
++}
++
++// Virtual mouse: right stick moves the cursor, ZR = left click, ZL = right click.
++void DisplayServerSwitch::_mouse_button(MouseButton p_button, bool p_pressed) {
++	MouseButtonMask m = mouse_button_to_mask(p_button);
++	if (p_pressed) {
++		mouse_buttons.set_flag(m);
++	} else {
++		mouse_buttons.clear_flag(m);
++	}
++	Ref<InputEventMouseButton> ev;
++	ev.instantiate();
++	ev->set_button_index(p_button);
++	ev->set_pressed(p_pressed);
++	ev->set_position(mouse_pos);
++	ev->set_global_position(mouse_pos);
++	ev->set_button_mask(mouse_buttons);
++	Input::get_singleton()->parse_input_event(ev);
++}
++
++void DisplayServerSwitch::_poll_cursor(u64 p_buttons, u64 p_prev) {
++	uint64_t now = OS::get_singleton()->get_ticks_usec();
++	float dt = last_ticks ? MIN((now - last_ticks) / 1000000.0f, 0.1f) : 0.0f;
++	last_ticks = now;
++
++	HidAnalogStickState r = padGetStickPos(&pad, 1);
++	Vector2 v(r.x / float(JOYSTICK_MAX), -r.y / float(JOYSTICK_MAX));
++	float len = v.length();
++	const float dead = 0.15f;
++	if (len > dead) {
++		// Curve for fine aiming near the centre; full tilt crosses the screen in ~1 s.
++		float t = MIN((len - dead) / (1.0f - dead), 1.0f);
++		Vector2 vel = v / len * (t * t) * size.x * 1.0f;
++		Vector2 np = (cursor_pos + vel * dt).clamp(Vector2(), Vector2(size.x - 1, size.y - 1));
++		Vector2 rel = np - cursor_pos;
++		cursor_pos = np;
++		Point2i ip = Point2i(np);
++		if (ip != mouse_pos || rel != Vector2()) {
++			Vector2 old = mouse_pos;
++			mouse_pos = ip;
++			Ref<InputEventMouseMotion> ev;
++			ev.instantiate();
++			ev->set_position(mouse_pos);
++			ev->set_global_position(mouse_pos);
++			ev->set_relative(Vector2(mouse_pos) - old);
++			ev->set_velocity(vel);
++			ev->set_button_mask(mouse_buttons);
++			Input::get_singleton()->parse_input_event(ev);
++		}
++	}
++
++	u64 changed = p_buttons ^ p_prev;
++	if (changed & HidNpadButton_ZR) {
++		_mouse_button(MouseButton::LEFT, p_buttons & HidNpadButton_ZR);
++	}
++	if (changed & HidNpadButton_ZL) {
++		_mouse_button(MouseButton::RIGHT, p_buttons & HidNpadButton_ZL);
++	}
++}
++
++void DisplayServerSwitch::mouse_set_mode(MouseMode p_mode) {
++	mouse_mode = p_mode;
++	ProjectSettings::get_singleton()->set_setting("nx/cursor_visible", p_mode == MOUSE_MODE_VISIBLE || p_mode == MOUSE_MODE_CONFINED);
++}
++
++void DisplayServerSwitch::warp_mouse(const Point2i &p_position) {
++	mouse_pos = p_position;
++	cursor_pos = p_position;
++}
++
++void DisplayServerSwitch::cursor_set_custom_image(const Ref<Resource> &p_cursor, CursorShape p_shape, const Vector2 &p_hotspot) {
++	// Drawn by res://nx/NxCursor.gd (an overlay autoload): hand it the game's cursor image.
++	if (p_shape != CURSOR_ARROW) {
++		return;
++	}
++	ProjectSettings::get_singleton()->set_setting("nx/cursor", p_cursor);
++	ProjectSettings::get_singleton()->set_setting("nx/cursor_hotspot", p_hotspot);
++}
++
++void DisplayServerSwitch::process_events() {
++	_poll_joypad();
++	_poll_touch();
++	Input::get_singleton()->flush_buffered_events();
++}
++
++void DisplayServerSwitch::swap_buffers() {
++#ifdef GLES3_ENABLED
++	if (egl_display != EGL_NO_DISPLAY) {
++		eglSwapBuffers(egl_display, egl_surface);
++	}
++#endif
++}
++
++void DisplayServerSwitch::window_set_vsync_mode(VSyncMode p_vsync_mode, WindowID p_window) {
++	vsync_mode = p_vsync_mode;
++#ifdef VULKAN_ENABLED
++	if (context_vulkan) {
++		context_vulkan->set_vsync_mode(p_window, p_vsync_mode);
++	}
++#endif
++#ifdef GLES3_ENABLED
++	if (egl_display != EGL_NO_DISPLAY) {
++		// nx/swap_interval: 1 = 60 Hz, 2 = locked 30 fps (set in override.cfg as [nx] swap_interval=2).
++		int interval = 1;
++		if (ProjectSettings::get_singleton() && ProjectSettings::get_singleton()->has_setting("nx/swap_interval")) {
++			interval = CLAMP((int)GLOBAL_GET("nx/swap_interval"), 1, 4);
++		}
++		eglSwapInterval(egl_display, p_vsync_mode == VSYNC_DISABLED ? 0 : interval);
++#ifdef NX_ZINK
++		// Zink presents through Vulkan (FIFO): the hook enforces intervals above 1 (nx_zink_hook.cpp).
++		extern int nx_zink_swap_interval;
++		nx_zink_swap_interval = p_vsync_mode == VSYNC_DISABLED ? 0 : interval;
++#endif
++	}
++#endif
++}
++
++DisplayServer::VSyncMode DisplayServerSwitch::window_get_vsync_mode(WindowID p_window) const {
++	return vsync_mode;
++}
++
++bool DisplayServerSwitch::has_feature(Feature p_feature) const {
++	switch (p_feature) {
++		case FEATURE_TOUCHSCREEN:
++		case FEATURE_MOUSE:
++			return true;
++		default:
++			return false;
++	}
++}
++
++String DisplayServerSwitch::get_name() const { return "switch"; }
++int DisplayServerSwitch::get_screen_count() const { return 1; }
++int DisplayServerSwitch::get_primary_screen() const { return 0; }
++Point2i DisplayServerSwitch::screen_get_position(int p_screen) const { return Point2i(); }
++Size2i DisplayServerSwitch::screen_get_size(int p_screen) const { return size; }
++Rect2i DisplayServerSwitch::screen_get_usable_rect(int p_screen) const { return Rect2i(Point2i(), size); }
++int DisplayServerSwitch::screen_get_dpi(int p_screen) const { return size.x == 1280 ? 237 : 96; }
++float DisplayServerSwitch::screen_get_refresh_rate(int p_screen) const { return 60.0f; }
++
++Vector<DisplayServer::WindowID> DisplayServerSwitch::get_window_list() const {
++	Vector<WindowID> l;
++	l.push_back(MAIN_WINDOW_ID);
++	return l;
++}
++DisplayServer::WindowID DisplayServerSwitch::get_window_at_screen_position(const Point2i &p_position) const { return MAIN_WINDOW_ID; }
++void DisplayServerSwitch::window_attach_instance_id(ObjectID p_instance, WindowID p_window) { instance_id = p_instance; }
++ObjectID DisplayServerSwitch::window_get_attached_instance_id(WindowID p_window) const { return instance_id; }
++void DisplayServerSwitch::window_set_rect_changed_callback(const Callable &p_callable, WindowID p_window) { rect_changed_callback = p_callable; }
++void DisplayServerSwitch::window_set_window_event_callback(const Callable &p_callable, WindowID p_window) { window_event_callback = p_callable; }
++void DisplayServerSwitch::window_set_input_event_callback(const Callable &p_callable, WindowID p_window) { input_event_callback = p_callable; }
++void DisplayServerSwitch::window_set_input_text_callback(const Callable &p_callable, WindowID p_window) { input_text_callback = p_callable; }
++void DisplayServerSwitch::window_set_drop_files_callback(const Callable &p_callable, WindowID p_window) {}
++void DisplayServerSwitch::window_set_title(const String &p_title, WindowID p_window) {}
++int DisplayServerSwitch::window_get_current_screen(WindowID p_window) const { return 0; }
++void DisplayServerSwitch::window_set_current_screen(int p_screen, WindowID p_window) {}
++Point2i DisplayServerSwitch::window_get_position(WindowID p_window) const { return Point2i(); }
++Point2i DisplayServerSwitch::window_get_position_with_decorations(WindowID p_window) const { return Point2i(); }
++void DisplayServerSwitch::window_set_position(const Point2i &p_position, WindowID p_window) {}
++void DisplayServerSwitch::window_set_transient(WindowID p_window, WindowID p_parent) {}
++void DisplayServerSwitch::window_set_max_size(const Size2i p_size, WindowID p_window) {}
++Size2i DisplayServerSwitch::window_get_max_size(WindowID p_window) const { return size; }
++void DisplayServerSwitch::window_set_min_size(const Size2i p_size, WindowID p_window) {}
++Size2i DisplayServerSwitch::window_get_min_size(WindowID p_window) const { return size; }
++void DisplayServerSwitch::window_set_size(const Size2i p_size, WindowID p_window) {}
++Size2i DisplayServerSwitch::window_get_size(WindowID p_window) const { return size; }
++Size2i DisplayServerSwitch::window_get_size_with_decorations(WindowID p_window) const { return size; }
++void DisplayServerSwitch::window_set_mode(WindowMode p_mode, WindowID p_window) {}
++DisplayServer::WindowMode DisplayServerSwitch::window_get_mode(WindowID p_window) const { return WINDOW_MODE_FULLSCREEN; }
++bool DisplayServerSwitch::window_is_maximize_allowed(WindowID p_window) const { return false; }
++void DisplayServerSwitch::window_set_flag(WindowFlags p_flag, bool p_enabled, WindowID p_window) {}
++bool DisplayServerSwitch::window_get_flag(WindowFlags p_flag, WindowID p_window) const { return false; }
++void DisplayServerSwitch::window_request_attention(WindowID p_window) {}
++void DisplayServerSwitch::window_move_to_foreground(WindowID p_window) {}
++bool DisplayServerSwitch::window_is_focused(WindowID p_window) const { return focused; }
++bool DisplayServerSwitch::window_can_draw(WindowID p_window) const { return true; }
++bool DisplayServerSwitch::can_any_window_draw() const { return true; }
+diff --git a/platform/switch/display_server_switch.h b/platform/switch/display_server_switch.h
+new file mode 100644
+index 0000000..d177350
+--- /dev/null
++++ b/platform/switch/display_server_switch.h
+@@ -0,0 +1,118 @@
++#ifndef DISPLAY_SERVER_SWITCH_H
++#define DISPLAY_SERVER_SWITCH_H
++
++#include "servers/display_server.h"
++
++#include "nx.h"
++
++#ifdef VULKAN_ENABLED
++class VulkanContextSwitch;
++class RenderingDeviceVulkan;
++#endif
++
++class DisplayServerSwitch : public DisplayServer {
++
++	EGLDisplay egl_display = EGL_NO_DISPLAY;
++	EGLContext egl_context = EGL_NO_CONTEXT;
++	EGLSurface egl_surface = EGL_NO_SURFACE;
++	VSyncMode vsync_mode = VSYNC_ENABLED;
++	String rendering_driver;
++#ifdef VULKAN_ENABLED
++	VulkanContextSwitch *context_vulkan = nullptr;
++	RenderingDeviceVulkan *rendering_device_vulkan = nullptr;
++#endif
++
++	Size2i size = Size2i(1280, 720);
++	ObjectID instance_id;
++	Callable rect_changed_callback;
++	Callable window_event_callback;
++	Callable input_event_callback;
++	Callable input_text_callback;
++
++	PadState pad;
++	u64 prev_buttons = 0;
++	float prev_axes[6] = {};
++	bool joy_connected = false;
++	HidTouchScreenState prev_touch = {};
++	bool focused = true;
++	Point2i mouse_pos;
++	Vector2 cursor_pos;
++	MouseMode mouse_mode = MOUSE_MODE_VISIBLE;
++	BitField<MouseButtonMask> mouse_buttons;
++	uint64_t last_ticks = 0;
++	void _poll_cursor(u64 p_buttons, u64 p_prev);
++	void _mouse_button(MouseButton p_button, bool p_pressed);
++
++	bool _init_egl();
++	void _poll_joypad();
++	void _poll_touch();
++	void _send_window_event(WindowEvent p_event);
++	static void _dispatch_input_event(const Ref<InputEvent> &p_event);
++	static void _applet_hook(AppletHookType p_hook, void *p_param);
++	AppletHookCookie applet_cookie;
++
++public:
++	static DisplayServer *create_func(const String &p_rendering_driver, WindowMode p_window_mode, VSyncMode p_vsync_mode, uint32_t p_flags, const Point2i *p_position, const Size2i &p_resolution, int p_screen, Error &r_error);
++	static Vector<String> get_rendering_drivers_func();
++	static void register_switch_driver();
++
++	bool has_feature(Feature p_feature) const override;
++	String get_name() const override;
++	int get_screen_count() const override;
++	int get_primary_screen() const override;
++	Point2i screen_get_position(int p_screen = SCREEN_OF_MAIN_WINDOW) const override;
++	Size2i screen_get_size(int p_screen = SCREEN_OF_MAIN_WINDOW) const override;
++	Rect2i screen_get_usable_rect(int p_screen = SCREEN_OF_MAIN_WINDOW) const override;
++	int screen_get_dpi(int p_screen = SCREEN_OF_MAIN_WINDOW) const override;
++	float screen_get_refresh_rate(int p_screen = SCREEN_OF_MAIN_WINDOW) const override;
++	Vector<DisplayServer::WindowID> get_window_list() const override;
++	WindowID get_window_at_screen_position(const Point2i &p_position) const override;
++	void window_attach_instance_id(ObjectID p_instance, WindowID p_window = MAIN_WINDOW_ID) override;
++	ObjectID window_get_attached_instance_id(WindowID p_window = MAIN_WINDOW_ID) const override;
++	void window_set_rect_changed_callback(const Callable &p_callable, WindowID p_window = MAIN_WINDOW_ID) override;
++	void window_set_window_event_callback(const Callable &p_callable, WindowID p_window = MAIN_WINDOW_ID) override;
++	void window_set_input_event_callback(const Callable &p_callable, WindowID p_window = MAIN_WINDOW_ID) override;
++	void window_set_input_text_callback(const Callable &p_callable, WindowID p_window = MAIN_WINDOW_ID) override;
++	void window_set_drop_files_callback(const Callable &p_callable, WindowID p_window = MAIN_WINDOW_ID) override;
++	void window_set_title(const String &p_title, WindowID p_window = MAIN_WINDOW_ID) override;
++	int window_get_current_screen(WindowID p_window = MAIN_WINDOW_ID) const override;
++	void window_set_current_screen(int p_screen, WindowID p_window = MAIN_WINDOW_ID) override;
++	Point2i window_get_position(WindowID p_window = MAIN_WINDOW_ID) const override;
++	Point2i window_get_position_with_decorations(WindowID p_window = MAIN_WINDOW_ID) const override;
++	void window_set_position(const Point2i &p_position, WindowID p_window = MAIN_WINDOW_ID) override;
++	void window_set_transient(WindowID p_window, WindowID p_parent) override;
++	void window_set_max_size(const Size2i p_size, WindowID p_window = MAIN_WINDOW_ID) override;
++	Size2i window_get_max_size(WindowID p_window = MAIN_WINDOW_ID) const override;
++	void window_set_min_size(const Size2i p_size, WindowID p_window = MAIN_WINDOW_ID) override;
++	Size2i window_get_min_size(WindowID p_window = MAIN_WINDOW_ID) const override;
++	void window_set_size(const Size2i p_size, WindowID p_window = MAIN_WINDOW_ID) override;
++	Size2i window_get_size(WindowID p_window = MAIN_WINDOW_ID) const override;
++	Size2i window_get_size_with_decorations(WindowID p_window = MAIN_WINDOW_ID) const override;
++	void window_set_mode(WindowMode p_mode, WindowID p_window = MAIN_WINDOW_ID) override;
++	WindowMode window_get_mode(WindowID p_window = MAIN_WINDOW_ID) const override;
++	bool window_is_maximize_allowed(WindowID p_window = MAIN_WINDOW_ID) const override;
++	void window_set_flag(WindowFlags p_flag, bool p_enabled, WindowID p_window = MAIN_WINDOW_ID) override;
++	bool window_get_flag(WindowFlags p_flag, WindowID p_window = MAIN_WINDOW_ID) const override;
++	void window_request_attention(WindowID p_window = MAIN_WINDOW_ID) override;
++	void window_move_to_foreground(WindowID p_window = MAIN_WINDOW_ID) override;
++	bool window_is_focused(WindowID p_window = MAIN_WINDOW_ID) const override;
++	bool window_can_draw(WindowID p_window = MAIN_WINDOW_ID) const override;
++	bool can_any_window_draw() const override;
++	void process_events() override;
++
++	void window_set_vsync_mode(VSyncMode p_vsync_mode, WindowID p_window = MAIN_WINDOW_ID) override;
++	VSyncMode window_get_vsync_mode(WindowID p_window) const override;
++	Point2i mouse_get_position() const override { return mouse_pos; }
++	void mouse_set_mode(MouseMode p_mode) override;
++	MouseMode mouse_get_mode() const override { return mouse_mode; }
++	void warp_mouse(const Point2i &p_position) override;
++	BitField<MouseButtonMask> mouse_get_button_state() const override { return mouse_buttons; }
++	void cursor_set_shape(CursorShape p_shape) override {}
++	void cursor_set_custom_image(const Ref<Resource> &p_cursor, CursorShape p_shape = CURSOR_ARROW, const Vector2 &p_hotspot = Vector2()) override;
++	void swap_buffers() override;
++
++	DisplayServerSwitch(const String &p_rendering_driver, WindowMode p_window_mode, VSyncMode p_vsync_mode, uint32_t p_flags, const Point2i *p_position, const Size2i &p_resolution, int p_screen, Error &r_error);
++	~DisplayServerSwitch();
++};
++
++#endif
+diff --git a/platform/switch/godot_switch.cpp b/platform/switch/godot_switch.cpp
+new file mode 100644
+index 0000000..01d3dfa
+--- /dev/null
++++ b/platform/switch/godot_switch.cpp
+@@ -0,0 +1,123 @@
++#include "os_switch.h"
++
++#include "main/main.h"
++#include "core/io/file_access.h"
++#include "core/io/file_access_pack.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include "nx.h"
++
++static int nxlink_sock = -1;
++
++// nxvk needs the process to be an Application with the whole heap (as pt-pc does).
++extern "C" {
++u32 __nx_applet_type = AppletType_Application;
++size_t __nx_heap_size = 0;
++}
++
++extern "C" void userAppInit(void) {
++	socketInitializeDefault();
++	nxlink_sock = nxlinkStdio();
++	if (nxlink_sock < 0) {
++		socketExit();
++	}
++	setsysInitialize();
++	setInitialize();
++}
++
++extern "C" void userAppExit(void) {
++	setExit();
++	setsysExit();
++	if (nxlink_sock >= 0) {
++		close(nxlink_sock);
++		socketExit();
++	}
++}
++
++int main(int argc, char *argv[]) {
++	const char *argv0 = argc > 0 ? argv[0] : nullptr;
++	if (!argv0 || !strchr(argv0, '/')) {
++		// Some loaders (and emulators) pass no usable path.
++		argv0 = "sdmc:/switch/buckshot_roulette/buckshot_roulette.nro";
++	}
++
++	if (nxlink_sock < 0) {
++		// No nxlink host: log next to the NRO.
++		char path[512];
++		snprintf(path, sizeof(path), "%s", argv0);
++		char *slash = strrchr(path, '/');
++		snprintf(slash + 1, sizeof(path) - (slash + 1 - path), "godot_log.txt");
++		if (freopen(path, "w", stdout)) {
++			dup2(fileno(stdout), STDERR_FILENO);
++			setvbuf(stdout, nullptr, _IOLBF, 0);
++			setvbuf(stderr, nullptr, _IONBF, 0);
++		}
++	}
++
++	printf("[nx] main start\n");
++	// Test aid: NAME=VALUE lines in sdmc:/switch/buckshot_roulette/nx_env.txt become environment variables
++	// (driver knobs such as ZINK_DESCRIPTORS, NVK_DEBUG, MESA_*), before any graphics driver starts.
++	if (FILE *ef = fopen("sdmc:/switch/buckshot_roulette/nx_env.txt", "r")) {
++		char line[256];
++		while (fgets(line, sizeof(line), ef)) {
++			line[strcspn(line, "\r\n")] = 0;
++			char *eq = strchr(line, '=');
++			if (eq && line[0] != '#') {
++				*eq = 0;
++				setenv(line, eq + 1, 1);
++				printf("[nx] env %s=%s\n", line, eq + 1);
++			}
++		}
++		fclose(ef);
++	}
++	OS_Switch os(argv0);
++	printf("[nx] OS created\n");
++
++	// Renderer is chosen at build time: vulkan=yes (nxvk, Mobile) or opengl3=yes (Mesa GL, Compatibility).
++#ifdef VULKAN_ENABLED
++	const bool use_gl = false;
++#else
++	const bool use_gl = true;
++#endif
++	printf("[nx] renderer: %s\n", use_gl ? "opengl3/gl_compatibility" : "vulkan/mobile");
++	static char a0[] = "--rendering-method";
++	static char a2[] = "--rendering-driver";
++	static char m_gl[] = "gl_compatibility", m_vk[] = "mobile";
++	static char d_gl[] = "opengl3", d_vk[] = "vulkan";
++	char *a1 = use_gl ? m_gl : m_vk;
++	char *a3 = use_gl ? d_gl : d_vk;
++	char *args[64];
++	int n = 0;
++	args[n++] = a0;
++	args[n++] = a1;
++	args[n++] = a2;
++	args[n++] = a3;
++	for (int i = 1; i < argc && n < 63; i++) {
++		args[n++] = argv[i];
++	}
++	args[n] = nullptr;
++
++	printf("[nx] Main::setup\n");
++	Error err = Main::setup(argv0 ? argv0 : "godot", n, args);
++	if (err != OK) {
++		printf("Main::setup failed: %d\n", err);
++		fflush(stdout);
++		return 255;
++	}
++	{
++		// Small patch pack next to the NRO (port scripts): replaces files of the main pack, so script fixes do not need a new 700 MB pack.
++		String patch = String::utf8(argv0).get_base_dir().path_join("nx_patch.pck");
++		if (FileAccess::exists(patch)) {
++			bool ok = PackedData::get_singleton() && PackedData::get_singleton()->add_pack(patch, true, 0) == OK;
++			printf("[nx] patch pack %s: %s\n", patch.utf8().get_data(), ok ? "loaded" : "FAILED");
++		}
++	}
++	if (Main::start()) {
++		os.run();
++	}
++	Main::cleanup();
++	return os.get_exit_code();
++}
+diff --git a/platform/switch/nvk_compat.c b/platform/switch/nvk_compat.c
+new file mode 100644
+index 0000000..ce5c0e1
+--- /dev/null
++++ b/platform/switch/nvk_compat.c
+@@ -0,0 +1,133 @@
++/*
++ * Copyright © 2026 PalindromicBreadLoaf (palindromicbreadloaf@tuta.com)
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Link-time newlib gap fills for the Switch smoke apps.
++ */
++#include <sys/types.h> /* off_t, before <regex.h> which uses it undeclared */
++#include <dirent.h>
++#include <errno.h>
++#include <malloc.h>
++#include <pthread.h>
++#include <pwd.h>
++#include <signal.h>
++#include <stddef.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <regex.h>
++#include <signal.h>
++
++#include <switch.h>
++
++/* Back rust's getrandom with CSRNG so the values are actually random. */
++ssize_t getrandom(void *buf, size_t buflen, unsigned int flags)
++{
++   (void)flags;
++   randomGet(buf, buflen);
++   return (ssize_t)buflen;
++}
++
++/* newlib has memalign() but not posix_memalign(). */
++int posix_memalign(void **memptr, size_t alignment, size_t size)
++{
++   if (alignment < sizeof(void *) || (alignment & (alignment - 1)) != 0)
++      return EINVAL;
++   void *p = memalign(alignment, size);
++   if (!p)
++      return ENOMEM;
++   *memptr = p;
++   return 0;
++}
++
++uid_t getuid(void)  { return 0; }
++uid_t geteuid(void) { return 0; }
++gid_t getgid(void)  { return 0; }
++gid_t getegid(void) { return 0; }
++
++static long
++get_available_processor_count(void)
++{
++   u64 core_mask = 0;
++
++   if (R_FAILED(svcGetInfo(&core_mask, InfoType_CoreMask,
++                           CUR_PROCESS_HANDLE, 0)) ||
++       core_mask == 0)
++      return -1;
++
++   return __builtin_popcountll(core_mask);
++}
++
++/* Enough of sysconf for os_get_total_physical_memory() and page-size queries. */
++long sysconf(int name)
++{
++   switch (name) {
++   case _SC_PAGESIZE:         return 4096;
++   case _SC_PHYS_PAGES:       return (3ll * 1024 * 1024 * 1024) / 4096;
++   case _SC_NPROCESSORS_CONF:
++   case _SC_NPROCESSORS_ONLN: return get_available_processor_count();
++   default:                   return -1;
++   }
++}
++
++/* This is not meaningful for homebrew, but needed regardless,
++ * so compile is a no-op and every match reports "no match". */
++int regcomp(regex_t *preg, const char *regex, int cflags)
++{
++   (void)regex; (void)cflags;
++   if (preg) preg->re_nsub = 0;
++   return 0;
++}
++
++int regexec(const regex_t *preg, const char *string, size_t nmatch,
++            regmatch_t pmatch[], int eflags)
++{
++   (void)preg; (void)string; (void)nmatch; (void)pmatch; (void)eflags;
++   return REG_NOMATCH;
++}
++
++void regfree(regex_t *preg) { (void)preg; }
++
++/* Horizon has no POSIX signals, so there is no mask to save or restore.
++ * util_queue's threads are created through u_thread_create(), which only
++ * calls this to keep signals off the new thread. */
++int pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset)
++{
++   (void)how; (void)set;
++   if (oldset)
++      memset(oldset, 0, sizeof(*oldset));
++   return 0;
++}
++
++/* One process owns the SD card. */
++int flock(int fd, int operation)
++{
++   (void)fd; (void)operation;
++   return 0;
++}
++
++/* The rest are reached only from disk cache backends that Horizon does not
++ * use.
++ * They exist to satisfy the link and must fail rather than lie. */
++int dirfd(DIR *dirp)
++{
++   (void)dirp;
++   errno = ENOTSUP;
++   return -1;
++}
++
++int fstatat(int fd, const char *path, struct stat *buf, int flag)
++{
++   (void)fd; (void)path; (void)buf; (void)flag;
++   errno = ENOTSUP;
++   return -1;
++}
++
++int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen,
++               struct passwd **result)
++{
++   (void)uid; (void)pwd; (void)buf; (void)buflen;
++   if (result)
++      *result = NULL;
++   return ENOTSUP;
++}
+diff --git a/platform/switch/nx.h b/platform/switch/nx.h
+new file mode 100644
+index 0000000..4f38124
+--- /dev/null
++++ b/platform/switch/nx.h
+@@ -0,0 +1,22 @@
++#ifndef SWITCH_NX_H
++#define SWITCH_NX_H
++// libnx declares Thread, Mutex, Semaphore, AudioDriver... which clash with Godot classes.
++// Include libnx only through this header so its names become Nx*.
++#define Thread NxThread
++#define Mutex NxMutex
++#define Semaphore NxSemaphore
++#define AudioDriver NxAudioDriver
++#define RwLock NxRwLock
++#define CondVar NxCondVar
++#define Barrier NxBarrier
++#include <switch.h>
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++#undef Thread
++#undef Mutex
++#undef Semaphore
++#undef AudioDriver
++#undef RwLock
++#undef CondVar
++#undef Barrier
++#endif
+diff --git a/platform/switch/nx_zink_hook.cpp b/platform/switch/nx_zink_hook.cpp
+new file mode 100644
+index 0000000..d6e9aa9
+--- /dev/null
++++ b/platform/switch/nx_zink_hook.cpp
+@@ -0,0 +1,469 @@
++// Zink build (zink=yes): a tiny "Vulkan layer" between Zink and nxvk.
++//
++// Zink resolves Vulkan through two symbols; in the hooked archive (libnvk_gl_hooked.a, made with objcopy
++// --redefine-sym) they point here. Everything passes through, except:
++//   vkCreateDevice / vkGetDeviceQueue   remember Zink's device and queue
++//   vkCreateSwapchainKHR                FIFO, one more image, transfer usage (to read and write the images)
++//   vkQueuePresentKHR                   30 fps lock, and LSFG frame generation on Zink's own frame (no readback):
++//                                       the real frame goes into lsfg; the generated in-between frame is written into
++//                                       Zink's image and presented first, then the real frame from the next image.
++// LSFG (lsfg-vk, GPL-3.0-or-later) shaders come from the user's own Lossless.dll.
++
++#ifdef NX_ZINK
++
++#define VK_NO_PROTOTYPES
++#define VK_USE_PLATFORM_VI_NN
++#include <vulkan/vulkan.h>
++
++#ifdef NX_ZINK_LSFG
++#include <lsfg-vk-backend/lsfgvk.hpp>
++#include <lsfg-vk-common/vulkan/command_buffer.hpp>
++#endif
++
++#include <switch.h>
++
++#include <chrono>
++#include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <exception>
++#include <filesystem>
++#include <memory>
++
++extern "C" PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance instance, const char *pName);
++extern "C" PFN_vkVoidFunction vk_common_GetDeviceProcAddr(VkDevice device, const char *pName);
++
++// Settings shared with the display server / menu (set from GDScript through ProjectSettings in display_server_switch).
++extern "C" {
++int nx_zink_swap_interval = 1; // 2 = 30 fps lock
++int nx_zink_fg_wanted = 0; // frame generation requested
++}
++
++namespace {
++
++void logf(const char *fmt, ...) {
++	va_list ap;
++	va_start(ap, fmt);
++	printf("[nx zink] ");
++	vprintf(fmt, ap);
++	printf("\n");
++	fflush(stdout);
++	va_end(ap);
++}
++
++struct Real {
++	PFN_vkCreateDevice CreateDevice = nullptr;
++	PFN_vkGetDeviceQueue GetDeviceQueue = nullptr;
++	PFN_vkCreateSwapchainKHR CreateSwapchainKHR = nullptr;
++	PFN_vkGetSwapchainImagesKHR GetSwapchainImagesKHR = nullptr;
++	PFN_vkQueuePresentKHR QueuePresentKHR = nullptr;
++	PFN_vkAcquireNextImageKHR AcquireNextImageKHR = nullptr;
++	PFN_vkCreateCommandPool CreateCommandPool = nullptr;
++	PFN_vkAllocateCommandBuffers AllocateCommandBuffers = nullptr;
++	PFN_vkBeginCommandBuffer BeginCommandBuffer = nullptr;
++	PFN_vkEndCommandBuffer EndCommandBuffer = nullptr;
++	PFN_vkResetCommandBuffer ResetCommandBuffer = nullptr;
++	PFN_vkCmdPipelineBarrier CmdPipelineBarrier = nullptr;
++	PFN_vkCmdBlitImage CmdBlitImage = nullptr;
++	PFN_vkCmdCopyImage CmdCopyImage = nullptr;
++	PFN_vkQueueSubmit QueueSubmit = nullptr;
++	PFN_vkCreateSemaphore CreateSemaphore = nullptr;
++	PFN_vkCreateFence CreateFence = nullptr;
++	PFN_vkWaitForFences WaitForFences = nullptr;
++	PFN_vkResetFences ResetFences = nullptr;
++} R;
++
++struct State {
++	VkInstance instance = VK_NULL_HANDLE;
++	VkPhysicalDevice phys = VK_NULL_HANDLE;
++	VkDevice device = VK_NULL_HANDLE;
++	VkQueue queue = VK_NULL_HANDLE;
++	uint32_t queue_family = 0;
++	VkSwapchainKHR swapchain = VK_NULL_HANDLE;
++	VkExtent2D extent{};
++	VkFormat format = VK_FORMAT_UNDEFINED;
++	uint32_t image_count = 0;
++	VkImage images[8]{};
++	std::chrono::steady_clock::time_point last_present{};
++	// frame generation
++	bool fg_failed = false;
++	bool fg_ready = false;
++	uint64_t frame = 0;
++	uint64_t gen_shown = 0;
++	VkCommandPool pool = VK_NULL_HANDLE;
++	VkCommandBuffer cmd[2]{}, cmd2[2]{};
++	VkFence fence[2]{};
++	VkSemaphore real_ready[2]{}, gen_acquired[2]{}, gen_ready[8]{};
++#ifdef NX_ZINK_LSFG
++	std::unique_ptr<lsfgvk::backend::Instance> lsfg;
++	lsfgvk::backend::Context *ctx = nullptr;
++#endif
++	uint32_t fg_w = 960, fg_h = 540;
++} S;
++
++PFN_vkVoidFunction real_gdpa(VkDevice d, const char *n) { return vk_common_GetDeviceProcAddr(d, n); }
++
++VKAPI_ATTR void VKAPI_CALL hook_GetDeviceQueue(VkDevice device, uint32_t family, uint32_t index, VkQueue *queue) {
++	R.GetDeviceQueue(device, family, index, queue);
++	if (device == S.device && !S.queue) {
++		S.queue = *queue;
++		S.queue_family = family;
++	}
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL hook_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *info, const VkAllocationCallbacks *alloc, VkDevice *device) {
++	VkResult r = R.CreateDevice(phys, info, alloc, device);
++	if (r == VK_SUCCESS) {
++		S.phys = phys;
++		S.device = *device;
++		logf("Zink device %p", (void *)*device);
++	}
++	return r;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL hook_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *info, const VkAllocationCallbacks *alloc, VkSwapchainKHR *sc) {
++	VkSwapchainCreateInfoKHR ci = *info;
++	logf("Zink asks for %u swapchain images, present mode %d", info->minImageCount, (int)info->presentMode);
++	ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
++	ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++	ci.minImageCount = info->minImageCount + 1; // one image more than Zink plans for: the generated frame
++	VkResult r = R.CreateSwapchainKHR(device, &ci, alloc, sc);
++	if (r != VK_SUCCESS) {
++		logf("swapchain with extra image failed (%d), retrying as asked", (int)r);
++		ci.minImageCount = info->minImageCount;
++		r = R.CreateSwapchainKHR(device, &ci, alloc, sc);
++	}
++	if (r == VK_SUCCESS) {
++		S.swapchain = *sc;
++		S.extent = ci.imageExtent;
++		S.format = ci.imageFormat;
++		S.image_count = 8;
++		R.GetSwapchainImagesKHR(device, *sc, &S.image_count, S.images);
++		logf("swapchain %ux%u format %d, %u images", ci.imageExtent.width, ci.imageExtent.height, (int)ci.imageFormat, S.image_count);
++	}
++	return r;
++}
++
++void barrier(VkCommandBuffer c, VkImage img, VkImageLayout from, VkImageLayout to, VkAccessFlags src, VkAccessFlags dst) {
++	VkImageMemoryBarrier b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
++	b.srcAccessMask = src;
++	b.dstAccessMask = dst;
++	b.oldLayout = from;
++	b.newLayout = to;
++	b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++	b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++	b.image = img;
++	b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++	R.CmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
++}
++
++void blit(VkCommandBuffer c, VkImage src, VkImageLayout src_layout, VkExtent2D se, VkImage dst, VkImageLayout dst_layout, VkExtent2D de) {
++	VkImageBlit r{};
++	r.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++	r.srcOffsets[1] = { (int32_t)se.width, (int32_t)se.height, 1 };
++	r.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++	r.dstOffsets[1] = { (int32_t)de.width, (int32_t)de.height, 1 };
++	R.CmdBlitImage(c, src, src_layout, dst, dst_layout, 1, &r, VK_FILTER_LINEAR);
++}
++
++// 1:1 image copy when the sizes match (cheaper, and no filtering), else a scaled blit.
++void move(VkCommandBuffer c, VkImage src, VkImageLayout src_layout, VkExtent2D se, VkImage dst, VkImageLayout dst_layout, VkExtent2D de) {
++	if (se.width == de.width && se.height == de.height && S.format == VK_FORMAT_R8G8B8A8_UNORM) {
++		VkImageCopy r{};
++		r.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++		r.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++		r.extent = { se.width, se.height, 1 };
++		R.CmdCopyImage(c, src, src_layout, dst, dst_layout, 1, &r);
++	} else {
++		blit(c, src, src_layout, se, dst, dst_layout, de);
++	}
++}
++
++void pace() {
++	// 30 fps lock (FIFO presents one image per VBlank at most; wait so a frame stays on screen two of them).
++	if (nx_zink_swap_interval >= 2 && S.last_present.time_since_epoch().count()) {
++		const auto target = S.last_present + std::chrono::microseconds(33000 * (nx_zink_swap_interval - 1));
++		const auto now = std::chrono::steady_clock::now();
++		if (now < target) {
++			svcSleepThread(std::chrono::duration_cast<std::chrono::nanoseconds>(target - now).count());
++		}
++	}
++	S.last_present = std::chrono::steady_clock::now();
++}
++
++#ifdef NX_ZINK_LSFG
++bool fg_init() {
++	if (S.fg_ready || S.fg_failed) {
++		return S.fg_ready;
++	}
++	S.fg_failed = true; // until proven otherwise
++	if (!S.queue || !S.swapchain) {
++		return false;
++	}
++	if (S.extent.width && S.extent.height && S.extent.width <= 1280) { // handheld 720p; on a 1080p TV stay at 960x540
++		S.fg_w = S.extent.width; // same size as the swapchain: plain copies in and out, no scaling
++		S.fg_h = S.extent.height;
++	}
++	const char *dll = nullptr;
++	for (const char *p : { "sdmc:/switch/buckshot_roulette/Lossless.dll", "sdmc:/switch/pt/lsfg/Lossless.dll", "sdmc:/Lossless.dll" }) {
++		if (FILE *t = fopen(p, "rb")) {
++			fclose(t);
++			dll = p;
++			break;
++		}
++	}
++	if (!dll) {
++		logf("Lossless.dll not found: frame generation off");
++		return false;
++	}
++	try {
++		lsfgvk::backend::BorrowedDevice bd{};
++		bd.instance = S.instance;
++		bd.physicalDevice = S.phys;
++		bd.device = S.device;
++		bd.queueFamilyIndex = S.queue_family;
++		bd.queue = S.queue;
++		bd.getInstanceProcAddr = (PFN_vkGetInstanceProcAddr)vk_icdGetInstanceProcAddr;
++		auto t0 = std::chrono::steady_clock::now();
++		S.lsfg = std::make_unique<lsfgvk::backend::Instance>(bd, std::filesystem::path(dll), true);
++		S.ctx = &S.lsfg->openLocalContext(S.fg_w, S.fg_h, false, 2.0f, true, 1);
++		logf("lsfg ready on Zink's device in %.0f ms (%ux%u, %s)",
++				std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), S.fg_w, S.fg_h, dll);
++	} catch (const std::exception &e) {
++		logf("lsfg unavailable: %s", e.what());
++		return false;
++	}
++	VkCommandPoolCreateInfo pci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
++	pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++	pci.queueFamilyIndex = S.queue_family;
++	R.CreateCommandPool(S.device, &pci, nullptr, &S.pool);
++	VkCommandBufferAllocateInfo cai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
++	cai.commandPool = S.pool;
++	cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++	cai.commandBufferCount = 2;
++	R.AllocateCommandBuffers(S.device, &cai, S.cmd);
++	R.AllocateCommandBuffers(S.device, &cai, S.cmd2);
++	VkFenceCreateInfo fci{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
++	fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
++	VkSemaphoreCreateInfo sci{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
++	for (int i = 0; i < 2; i++) {
++		R.CreateFence(S.device, &fci, nullptr, &S.fence[i]);
++		R.CreateSemaphore(S.device, &sci, nullptr, &S.real_ready[i]);
++		R.CreateSemaphore(S.device, &sci, nullptr, &S.gen_acquired[i]);
++	}
++	for (uint32_t i = 0; i < S.image_count; i++) {
++		R.CreateSemaphore(S.device, &sci, nullptr, &S.gen_ready[i]);
++	}
++	S.fg_failed = false;
++	S.fg_ready = true;
++	return true;
++}
++
++// Frame generation around Zink's present of `idx`. nxvk checks out one swapchain image at a time, so the generated frame
++// goes into Zink's own image (presented first) and the real frame into the next image acquired after that.
++// The real frame is shown from lsfg's source copy (swapchain size up to 720p; 960x540 on a 1080p TV).
++bool fg_present(VkQueue queue, const VkPresentInfoKHR *info, uint32_t idx) {
++	const int s = (int)(S.frame & 1);
++	R.WaitForFences(S.device, 1, &S.fence[s], VK_TRUE, UINT64_MAX);
++	R.ResetFences(S.device, 1, &S.fence[s]);
++	VkImage zimg = S.images[idx];
++	const VkExtent2D fge{ S.fg_w, S.fg_h };
++	const bool have_gen = S.frame >= 1; // lsfg needs two source frames
++	VkPipelineStageFlags stages[8];
++	for (int i = 0; i < 8; i++) {
++		stages[i] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++	}
++	VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
++	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++	try {
++		VkImage src = S.lsfg->sourceImage(*S.ctx, S.frame & 1);
++		VkImage gen = S.lsfg->destinationImage(*S.ctx, 0);
++		// submit 1: Zink's frame -> lsfg source, lsfg passes, then (if any) the generated frame into Zink's image
++		VkCommandBuffer c = S.cmd[s];
++		R.ResetCommandBuffer(c, 0);
++		R.BeginCommandBuffer(c, &bi);
++		barrier(c, zimg, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
++		move(c, zimg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, S.extent, src, VK_IMAGE_LAYOUT_GENERAL, fge);
++		VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
++		mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
++		mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
++		R.CmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
++		S.lsfg->recordFrame(*S.ctx, vk::CommandBuffer(c));
++		if (have_gen) {
++			mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
++			mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++			R.CmdPipelineBarrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
++			barrier(c, zimg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
++			move(c, gen, VK_IMAGE_LAYOUT_GENERAL, fge, zimg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, S.extent);
++			barrier(c, zimg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
++		} else {
++			barrier(c, zimg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_READ_BIT, 0);
++		}
++		R.EndCommandBuffer(c);
++		VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
++		si.waitSemaphoreCount = info->waitSemaphoreCount;
++		si.pWaitSemaphores = info->pWaitSemaphores;
++		si.pWaitDstStageMask = stages;
++		si.commandBufferCount = 1;
++		si.pCommandBuffers = &c;
++		si.signalSemaphoreCount = 1;
++		si.pSignalSemaphores = &S.real_ready[s];
++		if (R.QueueSubmit(queue, 1, &si, have_gen ? VK_NULL_HANDLE : S.fence[s]) != VK_SUCCESS) {
++			return false;
++		}
++		// present Zink's image: the generated frame (or, on the first frame, the real one)
++		VkPresentInfoKHR p = *info;
++		p.waitSemaphoreCount = 1;
++		p.pWaitSemaphores = &S.real_ready[s];
++		R.QueuePresentKHR(queue, &p);
++
++		if (have_gen) {
++			// submit 2: the real frame into the next image (nothing is checked out now), presented one VBlank later
++			uint32_t ri = 0;
++			const VkResult ar = R.AcquireNextImageKHR(S.device, S.swapchain, 100000000ull, S.gen_acquired[s], VK_NULL_HANDLE, &ri);
++			static int ar_logged = 0;
++			if (ar_logged < 3) {
++				ar_logged++;
++				logf("acquire for the real frame: %d (image %u)", (int)ar, ri);
++			}
++			if (ar == VK_SUCCESS || ar == VK_SUBOPTIMAL_KHR) {
++				VkCommandBuffer c2 = S.cmd2[s];
++				R.ResetCommandBuffer(c2, 0);
++				R.BeginCommandBuffer(c2, &bi);
++				barrier(c2, S.images[ri], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
++				move(c2, src, VK_IMAGE_LAYOUT_GENERAL, fge, S.images[ri], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, S.extent);
++				barrier(c2, S.images[ri], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
++				R.EndCommandBuffer(c2);
++				VkSubmitInfo s2{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
++				s2.waitSemaphoreCount = 1;
++				s2.pWaitSemaphores = &S.gen_acquired[s];
++				s2.pWaitDstStageMask = stages;
++				s2.commandBufferCount = 1;
++				s2.pCommandBuffers = &c2;
++				s2.signalSemaphoreCount = 1;
++				s2.pSignalSemaphores = &S.gen_ready[ri];
++				if (R.QueueSubmit(queue, 1, &s2, S.fence[s]) == VK_SUCCESS) {
++					VkPresentInfoKHR p2{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
++					p2.waitSemaphoreCount = 1;
++					p2.pWaitSemaphores = &S.gen_ready[ri];
++					p2.swapchainCount = 1;
++					p2.pSwapchains = &S.swapchain;
++					p2.pImageIndices = &ri;
++					R.QueuePresentKHR(queue, &p2);
++					S.gen_shown++;
++				}
++			} else {
++				VkSubmitInfo s0{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
++				R.QueueSubmit(queue, 1, &s0, S.fence[s]);
++			}
++		}
++	} catch (const std::exception &e) {
++		logf("frame generation failed: %s", e.what());
++		S.fg_failed = true;
++		S.fg_ready = false;
++		return false;
++	}
++	S.frame++;
++	if (S.frame <= 3 || S.frame % 900 == 0) {
++		logf("frame %llu: %llu generated frames shown so far", (unsigned long long)S.frame, (unsigned long long)S.gen_shown);
++	}
++	return true;
++}
++#endif
++
++VKAPI_ATTR VkResult VKAPI_CALL hook_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *info) {
++#ifdef NX_ZINK_LSFG
++	// With frame generation the two presents per frame already hold the game at 30.
++	if (!(nx_zink_fg_wanted && S.fg_ready)) {
++		pace();
++	}
++	if (nx_zink_fg_wanted && info->swapchainCount == 1 && info->pSwapchains[0] == S.swapchain && fg_init()) {
++		if (fg_present(queue, info, info->pImageIndices[0])) {
++			if (info->pResults) {
++				info->pResults[0] = VK_SUCCESS;
++			}
++			return VK_SUCCESS;
++		}
++	}
++#else
++	pace();
++#endif
++	return R.QueuePresentKHR(queue, info);
++}
++
++} // namespace
++
++extern "C" PFN_vkVoidFunction nx_hook_GetDeviceProcAddr(VkDevice device, const char *name);
++
++extern "C" PFN_vkVoidFunction nx_hook_GetInstanceProcAddr(VkInstance instance, const char *name) {
++	PFN_vkVoidFunction f = vk_icdGetInstanceProcAddr(instance, name);
++	if (!name || !f) {
++		return f;
++	}
++	if (instance && !S.instance) {
++		S.instance = instance;
++	}
++	if (!strcmp(name, "vkCreateDevice")) {
++		R.CreateDevice = (PFN_vkCreateDevice)f;
++		return (PFN_vkVoidFunction)hook_CreateDevice;
++	}
++	if (!strcmp(name, "vkGetDeviceProcAddr")) {
++		return (PFN_vkVoidFunction)nx_hook_GetDeviceProcAddr;
++	}
++	// device-level entry points looked up through the instance
++	if (!strcmp(name, "vkQueuePresentKHR")) {
++		R.QueuePresentKHR = (PFN_vkQueuePresentKHR)f;
++		return (PFN_vkVoidFunction)hook_QueuePresentKHR;
++	}
++	if (!strcmp(name, "vkCreateSwapchainKHR")) {
++		R.CreateSwapchainKHR = (PFN_vkCreateSwapchainKHR)f;
++		return (PFN_vkVoidFunction)hook_CreateSwapchainKHR;
++	}
++	if (!strcmp(name, "vkGetDeviceQueue")) {
++		R.GetDeviceQueue = (PFN_vkGetDeviceQueue)f;
++		return (PFN_vkVoidFunction)hook_GetDeviceQueue;
++	}
++	return f;
++}
++
++extern "C" PFN_vkVoidFunction nx_hook_GetDeviceProcAddr(VkDevice device, const char *name) {
++	PFN_vkVoidFunction f = real_gdpa(device, name);
++	if (!name || !f) {
++		return f;
++	}
++	if (device && !R.QueueSubmit) {
++#define L(n) R.n = (PFN_vk##n)real_gdpa(device, "vk" #n);
++		L(GetDeviceQueue)
++		L(CreateSwapchainKHR)
++		L(GetSwapchainImagesKHR)
++		L(QueuePresentKHR)
++		L(AcquireNextImageKHR)
++		L(CreateCommandPool)
++		L(AllocateCommandBuffers)
++		L(BeginCommandBuffer)
++		L(EndCommandBuffer)
++		L(ResetCommandBuffer)
++		L(CmdPipelineBarrier)
++		L(CmdBlitImage)
++		L(CmdCopyImage)
++		L(QueueSubmit)
++		L(CreateSemaphore)
++		L(CreateFence)
++		L(WaitForFences)
++		L(ResetFences)
++#undef L
++	}
++	if (!strcmp(name, "vkGetDeviceQueue")) {
++		return (PFN_vkVoidFunction)hook_GetDeviceQueue;
++	}
++	if (!strcmp(name, "vkCreateSwapchainKHR")) {
++		return (PFN_vkVoidFunction)hook_CreateSwapchainKHR;
++	}
++	if (!strcmp(name, "vkQueuePresentKHR")) {
++		return (PFN_vkVoidFunction)hook_QueuePresentKHR;
++	}
++	return f;
++}
++
++#endif // NX_ZINK
+diff --git a/platform/switch/os_switch.cpp b/platform/switch/os_switch.cpp
+new file mode 100644
+index 0000000..b33d013
+--- /dev/null
++++ b/platform/switch/os_switch.cpp
+@@ -0,0 +1,112 @@
++#include "os_switch.h"
++
++#include "display_server_switch.h"
++
++#include "core/config/project_settings.h"
++#include "core/io/dir_access.h"
++#include "main/main.h"
++#include "servers/audio_server.h"
++
++#include "nx.h"
++
++#include <sys/stat.h>
++
++OS_Switch::OS_Switch(const char *p_argv0) {
++	exe_path = String::utf8(p_argv0 ? p_argv0 : "");
++	if (exe_path.is_empty() || !exe_path.contains("/")) {
++		exe_path = "sdmc:/switch/buckshot_roulette/buckshot_roulette.nro";
++	}
++	base_dir = exe_path.get_base_dir();
++	AudioDriverManager::add_driver(&audio_driver);
++}
++
++void OS_Switch::initialize() {
++	OS_Unix::initialize_core();
++	DisplayServerSwitch::register_switch_driver();
++
++	// Core types are not registered yet: use plain libc here.
++	mkdir(get_user_data_dir().utf8().get_data(), 0777);
++	mkdir(get_cache_path().utf8().get_data(), 0777);
++}
++
++void OS_Switch::set_main_loop(MainLoop *p_main_loop) {
++	main_loop = p_main_loop;
++}
++
++void OS_Switch::delete_main_loop() {
++	if (main_loop) {
++		memdelete(main_loop);
++	}
++	main_loop = nullptr;
++}
++
++void OS_Switch::finalize() {
++	delete_main_loop();
++}
++
++bool OS_Switch::_check_internal_feature_support(const String &p_feature) {
++	return p_feature == "mobile" || p_feature == "switch" || p_feature == "nx" || p_feature == "etc2" || p_feature == "s3tc" || p_feature == "bptc";
++}
++
++String OS_Switch::get_version() const {
++	SetSysFirmwareVersion fw;
++	if (R_SUCCEEDED(setsysGetFirmwareVersion(&fw))) {
++		return String::utf8(fw.display_version);
++	}
++	return "";
++}
++
++String OS_Switch::get_locale() const {
++	u64 code = 0;
++	SetLanguage lang = SetLanguage_ENUS;
++	if (R_SUCCEEDED(setGetSystemLanguage(&code)) && R_SUCCEEDED(setMakeLanguage(code, &lang))) {
++		switch (lang) {
++			case SetLanguage_JA: return "ja";
++			case SetLanguage_FR: case SetLanguage_FRCA: return "fr";
++			case SetLanguage_DE: return "de";
++			case SetLanguage_IT: return "it";
++			case SetLanguage_ES: case SetLanguage_ES419: return "es";
++			case SetLanguage_ZHCN: case SetLanguage_ZHHANS: return "zh_CN";
++			case SetLanguage_ZHTW: case SetLanguage_ZHHANT: return "zh_TW";
++			case SetLanguage_KO: return "ko";
++			case SetLanguage_NL: return "nl";
++			case SetLanguage_PT: case SetLanguage_PTBR: return "pt";
++			case SetLanguage_RU: return "ru";
++			default: return "en";
++		}
++	}
++	return "en";
++}
++
++Dictionary OS_Switch::get_memory_info() const {
++	Dictionary meminfo;
++	u64 total = 0, used = 0;
++	svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
++	svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
++	meminfo["physical"] = (int64_t)total;
++	meminfo["free"] = (int64_t)(total - used);
++	meminfo["available"] = (int64_t)(total - used);
++	meminfo["stack"] = -1;
++	return meminfo;
++}
++
++Error OS_Switch::get_entropy(uint8_t *r_buffer, int p_bytes) {
++	randomGet(r_buffer, p_bytes);
++	return OK;
++}
++
++void OS_Switch::run() {
++	if (!main_loop) {
++		return;
++	}
++	main_loop->initialize();
++	int it = 0;
++	while (appletMainLoop()) {
++		it++;
++		DisplayServer::get_singleton()->process_events();
++		if (Main::iteration()) {
++			break;
++		}
++	}
++	main_loop->finalize();
++}
+diff --git a/platform/switch/os_switch.h b/platform/switch/os_switch.h
+new file mode 100644
+index 0000000..b993ce2
+--- /dev/null
++++ b/platform/switch/os_switch.h
+@@ -0,0 +1,53 @@
++#ifndef OS_SWITCH_H
++#define OS_SWITCH_H
++
++#include "drivers/unix/os_unix.h"
++#include "audio_driver_switch.h"
++
++class OS_Switch : public OS_Unix {
++	MainLoop *main_loop = nullptr;
++	AudioDriverSwitch audio_driver;
++	String exe_path;
++	String base_dir;
++
++protected:
++	void initialize() override;
++	void set_main_loop(MainLoop *p_main_loop) override;
++	void delete_main_loop() override;
++	void finalize() override;
++	bool _check_internal_feature_support(const String &p_feature) override;
++
++public:
++	void initialize_joypads() override {}
++	MainLoop *get_main_loop() const override { return main_loop; }
++
++	String get_name() const override { return "Switch"; }
++	String get_distribution_name() const override { return "Horizon"; }
++	String get_version() const override;
++	String get_executable_path() const override { return exe_path; }
++
++	Error execute(const String &p_path, const List<String> &p_arguments, String *r_pipe = nullptr, int *r_exitcode = nullptr, bool read_stderr = false, Mutex *p_pipe_mutex = nullptr, bool p_open_console = false) override { return ERR_UNAVAILABLE; }
++	Error create_process(const String &p_path, const List<String> &p_arguments, ProcessID *r_child_id = nullptr, bool p_open_console = false) override { return ERR_UNAVAILABLE; }
++	Error kill(const ProcessID &p_pid) override { return ERR_UNAVAILABLE; }
++	int get_process_id() const override { return 1; }
++	bool is_process_running(const ProcessID &p_pid) const override { return false; }
++	Error shell_open(String p_uri) override { return ERR_UNAVAILABLE; }
++	Error open_dynamic_library(const String p_path, void *&p_library_handle, bool p_also_set_library_path = false, String *r_resolved_path = nullptr) override { return ERR_UNAVAILABLE; }
++
++	int get_processor_count() const override { return 3; }
++	String get_unique_id() const override { return "switch"; }
++	String get_locale() const override;
++	Dictionary get_memory_info() const override;
++	Error get_entropy(uint8_t *r_buffer, int p_bytes) override;
++
++	String get_data_path() const override { return base_dir; }
++	String get_config_path() const override { return base_dir; }
++	String get_cache_path() const override { return base_dir.path_join("cache"); }
++	String get_user_data_dir() const override { return base_dir.path_join("userdata"); }
++
++	void run();
++
++	OS_Switch(const char *p_argv0);
++};
++
++#endif
+diff --git a/platform/switch/platform_config.h b/platform/switch/platform_config.h
+new file mode 100644
+index 0000000..e33464f
+--- /dev/null
++++ b/platform/switch/platform_config.h
+@@ -0,0 +1,5 @@
++/* Godot Switch (Horizon / libnx) platform config. */
++#include <alloca.h>
++#include <malloc.h>
++
++#define OPENGL_INCLUDE_H "platform/switch/platform_gl.h"
+diff --git a/platform/switch/platform_gl.h b/platform/switch/platform_gl.h
+new file mode 100644
+index 0000000..3236924
+--- /dev/null
++++ b/platform/switch/platform_gl.h
+@@ -0,0 +1,24 @@
++#ifndef SWITCH_PLATFORM_GL_H
++#define SWITCH_PLATFORM_GL_H
++
++#include <GLES3/gl3.h>
++#include <GLES2/gl2ext.h>
++
++#ifndef GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_NUM_VIEWS_OVR
++#define GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_NUM_VIEWS_OVR 0x9630
++#define GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_BASE_VIEW_INDEX_OVR 0x9632
++#define GL_MAX_VIEWS_OVR 0x9631
++#define GL_FRAMEBUFFER_INCOMPLETE_VIEW_TARGETS_OVR 0x9633
++#endif
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++// Multiview (XR only) is never used on Switch.
++static inline void switch_glFramebufferTextureMultiviewOVR(GLenum, GLenum, GLuint, GLint, GLint, GLsizei) {}
++#define glFramebufferTextureMultiviewOVR switch_glFramebufferTextureMultiviewOVR
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/platform/switch/posix_stubs.c b/platform/switch/posix_stubs.c
+new file mode 100644
+index 0000000..f74c84e
+--- /dev/null
++++ b/platform/switch/posix_stubs.c
+@@ -0,0 +1,28 @@
++// POSIX calls that newlib/libnx do not provide. Godot only uses them for process control
++// and debugging hooks, which do not exist on Horizon.
++#include <errno.h>
++#include <signal.h>
++#include <stdio.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++
++mode_t umask(mode_t mask) { (void)mask; return 022; }
++pid_t waitpid(pid_t pid, int *status, int options) { (void)pid; (void)status; (void)options; errno = ECHILD; return -1; }
++int sigaction(int sig, const struct sigaction *act, struct sigaction *old) { (void)sig; (void)act; (void)old; return 0; }
++int execvp(const char *file, char *const argv[]) { (void)file; (void)argv; errno = ENOSYS; return -1; }
++FILE *popen(const char *cmd, const char *mode) { (void)cmd; (void)mode; errno = ENOSYS; return NULL; }
++int pclose(FILE *f) { (void)f; return -1; }
++pid_t setsid(void) { errno = ENOSYS; return -1; }
++
++// newlib's getentropy (arc4random_buf in libexpat, used by nxvk) needs this hook; libnx does not supply it.
++#include <switch/kernel/random.h>
++struct _reent;
++int _getentropy_r(struct _reent *r, void *buf, size_t len) {
++	(void)r;
++	if (len > 256) {
++		errno = EIO;
++		return -1;
++	}
++	randomGet(buf, len);
++	return 0;
++}
+diff --git a/platform/switch/vulkan_context_switch.cpp b/platform/switch/vulkan_context_switch.cpp
+new file mode 100644
+index 0000000..078d675
+--- /dev/null
++++ b/platform/switch/vulkan_context_switch.cpp
+@@ -0,0 +1,21 @@
++#include "vulkan_context_switch.h"
++
++#ifdef VULKAN_ENABLED
++
++#include <volk.h>
++
++const char *VulkanContextSwitch::_get_platform_surface_extension() const {
++	return VK_NN_VI_SURFACE_EXTENSION_NAME;
++}
++
++Error VulkanContextSwitch::window_create(void *p_nwindow, DisplayServer::VSyncMode p_vsync_mode, int p_width, int p_height) {
++	VkViSurfaceCreateInfoNN info = {};
++	info.sType = VK_STRUCTURE_TYPE_VI_SURFACE_CREATE_INFO_NN;
++	info.window = p_nwindow;
++	VkSurfaceKHR surface;
++	VkResult err = vkCreateViSurfaceNN(get_instance(), &info, nullptr, &surface);
++	ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, ERR_CANT_CREATE, "vkCreateViSurfaceNN failed with error " + itos(err));
++	return _window_create(DisplayServer::MAIN_WINDOW_ID, p_vsync_mode, surface, p_width, p_height);
++}
++
++#endif
+diff --git a/platform/switch/vulkan_context_switch.h b/platform/switch/vulkan_context_switch.h
+new file mode 100644
+index 0000000..eaf54de
+--- /dev/null
++++ b/platform/switch/vulkan_context_switch.h
+@@ -0,0 +1,18 @@
++#ifndef VULKAN_CONTEXT_SWITCH_H
++#define VULKAN_CONTEXT_SWITCH_H
++
++#ifdef VULKAN_ENABLED
++
++#include "drivers/vulkan/vulkan_context.h"
++
++// Vulkan on the Switch through nxvk (Mesa NVK, linked statically): no loader, the driver's
++// vk_icdGetInstanceProcAddr feeds volk, and surfaces come from VK_NN_vi_surface on the default NWindow.
++class VulkanContextSwitch : public VulkanContext {
++	virtual const char *_get_platform_surface_extension() const override;
++
++public:
++	Error window_create(void *p_nwindow, DisplayServer::VSyncMode p_vsync_mode, int p_width, int p_height);
++};
++
++#endif
++#endif
+diff --git a/servers/rendering/shader_compiler.cpp b/servers/rendering/shader_compiler.cpp
+index 1515ed3..bb580dd 100644
+--- a/servers/rendering/shader_compiler.cpp
++++ b/servers/rendering/shader_compiler.cpp
+@@ -1322,6 +1322,20 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
+ 							code += node_code;
+ 						}
+ 					}
++#ifdef HORIZON_ENABLED
++					// Switch (OpenGL renderer): read SCREEN_TEXTURE at mip 0. Implicit-LOD texture() lets the GPU pick a mip
++					// from screen-space derivatives, and on Zink/NVK those are wrong in the 2x2 quads that straddle the two
++					// triangles of a screen rect: a dotted line along the diagonal of every full-screen screen shader.
++					if (is_internal_func && RS::get_singleton()->is_low_end() && vnode->name == "texture" && onode->arguments.size() == 3 &&
++							onode->arguments[1]->type == SL::Node::NODE_TYPE_VARIABLE) {
++						const StringName tu = static_cast<const SL::VariableNode *>(onode->arguments[1])->name;
++						if (shader->uniforms.has(tu) && shader->uniforms[tu].hint == ShaderLanguage::ShaderNode::Uniform::HINT_SCREEN_TEXTURE) {
++							if (code.begins_with("texture(")) { // this node's code starts with the call itself
++								code = "textureLod(" + code.substr(8) + ", 0.0";
++							}
++						}
++					}
++#endif
+ 					code += ")";
+ 					if (is_screen_texture && !texture_func_returns_data && actions.apply_luminance_multiplier) {
+ 						code = "(" + code + " * vec4(vec3(sc_luminance_multiplier), 1.0))";

@@ -1,0 +1,10 @@
+# game data and local builds: never committed
+extracted/
+pck/
+out/
+dist/
+godot/
+third_party/
+*.log
+*.pck
+*.nro
