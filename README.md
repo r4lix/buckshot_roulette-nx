@@ -12,11 +12,9 @@ I am **not a developer**, so the code may contain bugs, security vulnerabilities
 
 Use it at your own risk. I cannot guarantee support, stability, compatibility, security, or regular updates.
 
-## Note to the developer
+## Takedown notice
 
-Buckshot Roulette is © Mike Klubnika. This is an unofficial fan port made out of love for the game, and it is not affiliated with or endorsed by him. It contains no game files: players need their own Steam copy.
-
-**Mike, if you would rather this project not exist, just open an issue or message me on GitHub and I will take it down right away, no questions asked.**
+The NRO contains no game files: the game pack is built on your PC from your own Steam copy. If you are a right holder and want this project removed, contact me or open an issue and I will take it down within 48 hours.
 
 
 ## Install
