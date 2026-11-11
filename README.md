@@ -1,4 +1,5 @@
 # buckshot_roulette-nx
+<img width="1552" height="633" alt="image" src="https://github.com/user-attachments/assets/ab64a7a8-931a-4a85-8a37-4cea762547b3" />
 
 Buckshot Roulette (Godot 4.1) running natively on the Nintendo Switch.
 
@@ -11,11 +12,6 @@ This project was created **entirely with the help of AI coding tools**.
 I am **not a developer**, so the code may contain bugs, security vulnerabilities, mistakes, or unfinished features. buckshot_roulette-nx is a personal project that I decided to share with others who may find it useful.
 
 Use it at your own risk. I cannot guarantee support, stability, compatibility, security, or regular updates.
-
-## Takedown notice
-
-The NRO contains no game files: the game pack is built on your PC from your own Steam copy. If you are a right holder and want this project removed, contact me or open an issue and I will take it down within 48 hours.
-
 
 ## Install
 
@@ -30,9 +26,15 @@ The NRO contains no game files: the game pack is built on your PC from your own 
 Right stick moves the cursor, **ZR** / **ZL** click, the touch screen works too. Press **-** for the menu: graphics,
 sound and cheats.
 
-Multiplayer needs Steam and is not available.
+Multiplayer needs Steam and is not available. (for now)
 
 
 ## Building
 
-See [docs/ADVANCED.md](docs/ADVANCED.md).
+See [docs/ADVANCED.md](docs
+
+## Takedown notice
+
+I genuinely admire and support Mike's work. This is an unofficial fan-made port, created purely out of appreciation for a game I love.
+
+If Mike or any rights holder has any concerns or wishes for this project to be taken down, please contact me or open an issue. I will fully respect that request and take it down within 48 hours.
